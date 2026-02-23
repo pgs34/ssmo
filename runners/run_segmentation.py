@@ -1,8 +1,7 @@
 from __future__ import annotations
 
 import argparse
-from itertools import islice
-from typing import Tuple
+from typing import Callable, Optional, Tuple
 
 import numpy as np
 import torch
@@ -20,7 +19,7 @@ def parse_args():
     p.add_argument("--train-dataset", type=str, default="voc", choices=["voc", "cityscapes"])
     p.add_argument("--val-dataset", type=str, default="voc", choices=["voc", "cityscapes"])
     p.add_argument("--model", type=str, default="unet", choices=["unet", "deeplabv3_resnet50"])
-    p.add_argument("--method", type=str, default="independent", choices=["independent", "naive", "dml", "studygroup"])
+    p.add_argument("--method", type=str, default="dml", choices=["naive", "dml", "studygroup"])
     p.add_argument("--epochs", type=int, default=20)
     p.add_argument("--batch-size", type=int, default=8)
     p.add_argument("--lr", type=float, default=1e-3)
@@ -43,8 +42,6 @@ def parse_args():
     p.add_argument("--margin", type=float, default=0.0)
     p.add_argument("--warmup-epochs", type=int, default=0)
     p.add_argument("--live-plot-interval", type=int, default=20)
-    p.add_argument("--max-train-batches", type=int, default=None)
-    p.add_argument("--max-val-batches", type=int, default=None)
     return p.parse_args()
 
 
@@ -78,18 +75,118 @@ def update_iou_stats(
     return intersection, union, pixel_acc
 
 
-def train_one_epoch(model, loader, optimizer, device):
+def build_segmentation_imitation_loss_fn(
+    imitation_loss_name: str,
+) -> Callable[[torch.Tensor, torch.Tensor], torch.Tensor]:
+    if imitation_loss_name == "kl":
+        def _loss(logits: torch.Tensor, peer_logits: torch.Tensor) -> torch.Tensor:
+            teacher_prob = F.softmax(peer_logits.detach(), dim=1)
+            return F.kl_div(F.log_softmax(logits, dim=1), teacher_prob, reduction="none").sum(dim=1)
+
+        return _loss
+
+    if imitation_loss_name == "js":
+        def _loss(logits: torch.Tensor, peer_logits: torch.Tensor) -> torch.Tensor:
+            student_prob = torch.clamp(F.softmax(logits, dim=1), min=1e-8, max=1.0)
+            teacher_prob = torch.clamp(F.softmax(peer_logits.detach(), dim=1), min=1e-8, max=1.0)
+            mix = torch.clamp((student_prob + teacher_prob) * 0.5, min=1e-8, max=1.0)
+            return 0.5 * (
+                F.kl_div(torch.log(student_prob), mix, reduction="none").sum(dim=1)
+                + F.kl_div(torch.log(teacher_prob), mix, reduction="none").sum(dim=1)
+            )
+
+        return _loss
+
+    if imitation_loss_name == "mse_logits":
+        def _loss(logits: torch.Tensor, peer_logits: torch.Tensor) -> torch.Tensor:
+            return F.mse_loss(logits, peer_logits.detach(), reduction="none").mean(dim=1)
+
+        return _loss
+
+    raise ValueError(f"Unsupported segmentation imitation loss: {imitation_loss_name}")
+
+
+def _safe_masked_mean_map(loss_map: torch.Tensor, valid_mask: torch.Tensor) -> torch.Tensor:
+    denom = valid_mask.sum().clamp_min(1.0)
+    return (loss_map * valid_mask).sum() / denom
+
+
+def train_one_epoch(
+    model,
+    peer_model: Optional[torch.nn.Module],
+    loader,
+    optimizer,
+    peer_optimizer: Optional[torch.optim.Optimizer],
+    device,
+    imitation_loss_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
+    lambda_imitation: float,
+    margin: float,
+    method: str,
+):
     model.train()
+    if peer_model is not None:
+        peer_model.train()
     total_loss = 0.0
     total_count = 0
     for x, y in loader:
         x = x.to(device, non_blocking=True)
         y = y.to(device, non_blocking=True)
         optimizer.zero_grad(set_to_none=True)
+        if peer_optimizer is not None:
+            peer_optimizer.zero_grad(set_to_none=True)
+
         logits = model_forward(model, x)
-        loss = F.cross_entropy(logits, y, ignore_index=IGNORE_INDEX)
-        loss.backward()
-        optimizer.step()
+        valid_mask = (y != IGNORE_INDEX).to(dtype=logits.dtype)
+        supervised_map = F.cross_entropy(logits, y, ignore_index=IGNORE_INDEX, reduction="none")
+
+        if method == "naive":
+            loss = _safe_masked_mean_map(supervised_map, valid_mask)
+            loss.backward()
+            optimizer.step()
+
+        elif method == "dml":
+            if peer_model is None or peer_optimizer is None:
+                raise ValueError("peer_model and peer_optimizer are required when method='dml'")
+            peer_logits = model_forward(peer_model, x)
+            peer_supervised_map = F.cross_entropy(peer_logits, y, ignore_index=IGNORE_INDEX, reduction="none")
+
+            w_student = torch.relu(peer_supervised_map.detach() - supervised_map.detach() - margin) * valid_mask
+            imitation_map_student = imitation_loss_fn(logits, peer_logits)
+            imitation_term_student = _safe_masked_mean_map(imitation_map_student * w_student, w_student)
+            loss = _safe_masked_mean_map(supervised_map, valid_mask) + lambda_imitation * imitation_term_student
+
+            w_peer = torch.relu(supervised_map.detach() - peer_supervised_map.detach() - margin) * valid_mask
+            imitation_map_peer = imitation_loss_fn(peer_logits, logits)
+            imitation_term_peer = _safe_masked_mean_map(imitation_map_peer * w_peer, w_peer)
+            peer_loss = _safe_masked_mean_map(peer_supervised_map, valid_mask) + lambda_imitation * imitation_term_peer
+
+            (loss + peer_loss).backward()
+            optimizer.step()
+            peer_optimizer.step()
+
+        elif method == "studygroup":
+            if peer_model is None or peer_optimizer is None:
+                raise ValueError("peer_model and peer_optimizer are required when method='studygroup'")
+            peer_logits = model_forward(peer_model, x)
+            peer_supervised_map = F.cross_entropy(peer_logits, y, ignore_index=IGNORE_INDEX, reduction="none")
+
+            w_student = ((peer_supervised_map.detach() + margin) < supervised_map.detach()).to(dtype=logits.dtype) * valid_mask
+            imitation_map_student = imitation_loss_fn(logits, peer_logits)
+            imitation_term_student = _safe_masked_mean_map(imitation_map_student * w_student, w_student)
+            loss = _safe_masked_mean_map(supervised_map, valid_mask) + lambda_imitation * imitation_term_student
+
+            w_peer = ((supervised_map.detach() + margin) < peer_supervised_map.detach()).to(dtype=logits.dtype) * valid_mask
+            imitation_map_peer = imitation_loss_fn(peer_logits, logits)
+            imitation_term_peer = _safe_masked_mean_map(imitation_map_peer * w_peer, w_peer)
+            peer_loss = _safe_masked_mean_map(peer_supervised_map, valid_mask) + lambda_imitation * imitation_term_peer
+
+            (loss + peer_loss).backward()
+            optimizer.step()
+            peer_optimizer.step()
+
+        else:
+            raise ValueError(f"Unsupported method '{method}'")
+
         batch_size = x.size(0)
         total_loss += float(loss.item()) * batch_size
         total_count += batch_size
@@ -128,12 +225,6 @@ def evaluate(model, loader, device, num_classes: int):
     return total_loss / total_count, miou, pixel_acc
 
 
-def _iter_limited(loader, max_batches: int | None):
-    if max_batches is not None and max_batches > 0:
-        return islice(loader, max_batches)
-    return loader
-
-
 def main():
     args = parse_args()
     set_seed(args.seed)
@@ -166,10 +257,23 @@ def main():
     num_classes = int(val_meta["num_classes"])
 
     model = build_segmentation_model(args.model, num_classes=num_classes, in_channels=in_channels).to(device)
+    peer_model = None
+    peer_optimizer = None
+    if args.method in {"dml", "studygroup"}:
+        peer_model = build_segmentation_model(args.model, num_classes=num_classes, in_channels=in_channels).to(device)
+
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    if peer_model is not None:
+        peer_optimizer = torch.optim.AdamW(peer_model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    imitation_loss_fn = build_segmentation_imitation_loss_fn(args.segmentation_imitation_loss)
 
     dataset_tag = f"{args.train_dataset}_to_{args.val_dataset}"
-    run_dir = make_run_dir(args.output_dir, "segmentation", dataset_tag, f"{args.model}/{args.method}/seed{args.seed}")
+    run_dir = make_run_dir(
+        args.output_dir,
+        "segmentation",
+        dataset_tag,
+        f"{args.model}_{args.method}_{args.segmentation_imitation_loss}_seed{args.seed}",
+    )
     print(f"[segmentation] run_dir={run_dir}")
     print(f"[segmentation] params={count_parameters(model)}")
 
@@ -180,10 +284,27 @@ def main():
     best_val_miou = 0.0
 
     for epoch in range(1, args.epochs + 1):
-        tr_loss = train_one_epoch(model, _iter_limited(train_loader, args.max_train_batches), optimizer, device)
+        effective_lambda = args.lambda_imitation
+        if args.method == "naive":
+            effective_lambda = 0.0
+        elif args.method == "studygroup" and epoch <= args.warmup_epochs:
+            effective_lambda = 0.0
+
+        tr_loss = train_one_epoch(
+            model,
+            peer_model,
+            train_loader,
+            optimizer,
+            peer_optimizer,
+            device,
+            imitation_loss_fn=imitation_loss_fn,
+            lambda_imitation=effective_lambda,
+            margin=args.margin,
+            method=args.method,
+        )
         va_loss, va_miou, va_pixel_acc = evaluate(
             model,
-            _iter_limited(val_loader, args.max_val_batches),
+            val_loader,
             device,
             num_classes=num_classes,
         )
@@ -232,7 +353,7 @@ def main():
             "val_dataset": args.val_dataset,
             "method": args.method,
             "model": args.model,
-            "peer_model": args.model,
+            "peer_model": args.model if peer_model is not None else None,
             "curve_mode": "single",
             "model_idx": 1,
             "segmentation_imitation_loss": args.segmentation_imitation_loss,

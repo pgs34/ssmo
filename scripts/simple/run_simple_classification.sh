@@ -39,8 +39,6 @@ for MODEL in $MODELS; do
             --warmup-epochs "$WARMUP_STUDYGROUP"
           )
 
-          CMD+=(--download)
-
           "${CMD[@]}"
         done
       done

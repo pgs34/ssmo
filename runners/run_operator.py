@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import argparse
-from itertools import islice
+from typing import Callable, Optional
 
 import torch
 import torch.nn.functional as F
@@ -28,7 +28,7 @@ def parse_args():
             "uno",
         ],
     )
-    p.add_argument("--method", type=str, default="independent", choices=["independent", "naive", "dml", "studygroup"])
+    p.add_argument("--method", type=str, default="dml", choices=["naive", "dml", "studygroup"])
     p.add_argument("--epochs", type=int, default=20)
     p.add_argument("--batch-size", type=int, default=16)
     p.add_argument("--lr", type=float, default=1e-3)
@@ -43,8 +43,6 @@ def parse_args():
     p.add_argument("--margin", type=float, default=0.0)
     p.add_argument("--warmup-epochs", type=int, default=0)
     p.add_argument("--live-plot-interval", type=int, default=20)
-    p.add_argument("--max-train-batches", type=int, default=None)
-    p.add_argument("--max-val-batches", type=int, default=None)
     return p.parse_args()
 
 
@@ -60,8 +58,51 @@ def unpack_batch(batch):
     raise TypeError("Unsupported batch format.")
 
 
-def train_one_epoch(model, loader, optimizer, device):
+def build_regression_imitation_loss_fn(
+    imitation_loss_name: str,
+) -> Callable[[torch.Tensor, torch.Tensor], torch.Tensor]:
+    def _reduce_per_sample(loss_tensor: torch.Tensor) -> torch.Tensor:
+        if loss_tensor.ndim <= 1:
+            return loss_tensor.reshape(-1)
+        return loss_tensor.reshape(loss_tensor.shape[0], -1).mean(dim=1)
+
+    if imitation_loss_name == "mse":
+        def _loss(pred: torch.Tensor, peer_pred: torch.Tensor) -> torch.Tensor:
+            return _reduce_per_sample(F.mse_loss(pred, peer_pred.detach(), reduction="none"))
+
+        return _loss
+
+    if imitation_loss_name == "mae":
+        def _loss(pred: torch.Tensor, peer_pred: torch.Tensor) -> torch.Tensor:
+            return _reduce_per_sample(F.l1_loss(pred, peer_pred.detach(), reduction="none"))
+
+        return _loss
+
+    if imitation_loss_name == "huber":
+        def _loss(pred: torch.Tensor, peer_pred: torch.Tensor) -> torch.Tensor:
+            return _reduce_per_sample(F.smooth_l1_loss(pred, peer_pred.detach(), reduction="none"))
+
+        return _loss
+
+    raise ValueError(f"Unsupported regression imitation loss: {imitation_loss_name}")
+
+
+def train_one_epoch(
+    model,
+    peer_model: Optional[torch.nn.Module],
+    loader,
+    optimizer,
+    peer_optimizer: Optional[torch.optim.Optimizer],
+    device,
+    supervised_loss_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
+    imitation_loss_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
+    lambda_imitation: float,
+    margin: float,
+    method: str,
+):
     model.train()
+    if peer_model is not None:
+        peer_model.train()
     total_loss = 0.0
     total_count = 0
     for batch in loader:
@@ -70,10 +111,78 @@ def train_one_epoch(model, loader, optimizer, device):
         y = y.to(device, non_blocking=True)
 
         optimizer.zero_grad(set_to_none=True)
+        if peer_optimizer is not None:
+            peer_optimizer.zero_grad(set_to_none=True)
         pred = model(x)
-        loss = F.mse_loss(pred, y)
-        loss.backward()
-        optimizer.step()
+        supervised_loss = supervised_loss_fn(pred, y)
+
+        if method == "naive":
+            loss = supervised_loss.mean()
+            loss.backward()
+            optimizer.step()
+
+        elif method == "dml":
+            if peer_model is None or peer_optimizer is None:
+                raise ValueError("peer_model and peer_optimizer are required when method='dml'")
+            peer_pred = peer_model(x)
+            peer_supervised_loss = supervised_loss_fn(peer_pred, y)
+
+            w_student = torch.relu(peer_supervised_loss.detach() - supervised_loss.detach() - margin)
+            sample_loss = imitation_loss_fn(pred, peer_pred)
+            student_weight_sum = w_student.sum()
+            imitation_term_student = (
+                (sample_loss * w_student).sum() / (student_weight_sum + 1e-12)
+                if float(student_weight_sum.item()) > 0.0
+                else sample_loss.new_tensor(0.0)
+            )
+            loss = supervised_loss.mean() + lambda_imitation * imitation_term_student
+
+            w_peer = torch.relu(supervised_loss.detach() - peer_supervised_loss.detach() - margin)
+            sample_loss_peer = imitation_loss_fn(peer_pred, pred)
+            peer_weight_sum = w_peer.sum()
+            imitation_term_peer = (
+                (sample_loss_peer * w_peer).sum() / (peer_weight_sum + 1e-12)
+                if float(peer_weight_sum.item()) > 0.0
+                else sample_loss_peer.new_tensor(0.0)
+            )
+            peer_loss = peer_supervised_loss.mean() + lambda_imitation * imitation_term_peer
+
+            (loss + peer_loss).backward()
+            optimizer.step()
+            peer_optimizer.step()
+
+        elif method == "studygroup":
+            if peer_model is None or peer_optimizer is None:
+                raise ValueError("peer_model and peer_optimizer are required when method='studygroup'")
+            peer_pred = peer_model(x)
+            peer_supervised_loss = supervised_loss_fn(peer_pred, y)
+
+            w_student = ((peer_supervised_loss.detach() + margin) < supervised_loss.detach()).to(dtype=supervised_loss.dtype)
+            sample_loss = imitation_loss_fn(pred, peer_pred)
+            student_weight_sum = w_student.sum()
+            imitation_term_student = (
+                (sample_loss * w_student).sum() / (student_weight_sum + 1e-12)
+                if float(student_weight_sum.item()) > 0.0
+                else sample_loss.new_tensor(0.0)
+            )
+            loss = supervised_loss.mean() + lambda_imitation * imitation_term_student
+
+            w_peer = ((supervised_loss.detach() + margin) < peer_supervised_loss.detach()).to(dtype=peer_supervised_loss.dtype)
+            sample_loss_peer = imitation_loss_fn(peer_pred, pred)
+            peer_weight_sum = w_peer.sum()
+            imitation_term_peer = (
+                (sample_loss_peer * w_peer).sum() / (peer_weight_sum + 1e-12)
+                if float(peer_weight_sum.item()) > 0.0
+                else sample_loss_peer.new_tensor(0.0)
+            )
+            peer_loss = peer_supervised_loss.mean() + lambda_imitation * imitation_term_peer
+
+            (loss + peer_loss).backward()
+            optimizer.step()
+            peer_optimizer.step()
+
+        else:
+            raise ValueError(f"Unsupported method '{method}'")
 
         batch_size = x.size(0)
         total_loss += float(loss.item()) * batch_size
@@ -101,12 +210,6 @@ def evaluate(model, loader, device):
     return total_mse / total_count, total_mae / total_count
 
 
-def _iter_limited(loader, max_batches: int | None):
-    if max_batches is not None and max_batches > 0:
-        return islice(loader, max_batches)
-    return loader
-
-
 def main():
     args = parse_args()
     set_seed(args.seed)
@@ -126,9 +229,23 @@ def main():
     meta = data["meta"]
 
     model = build_operator_model(args.model, args.dataset, meta).to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    peer_model = None
+    peer_optimizer = None
+    if args.method in {"dml", "studygroup"}:
+        peer_model = build_operator_model(args.model, args.dataset, meta).to(device)
 
-    run_dir = make_run_dir(args.output_dir, "operator", args.dataset, f"{args.model}/{args.method}/seed{args.seed}")
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    if peer_model is not None:
+        peer_optimizer = torch.optim.AdamW(peer_model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    supervised_loss_fn = build_regression_imitation_loss_fn("mse")
+    imitation_loss_fn = build_regression_imitation_loss_fn(args.regression_imitation_loss)
+
+    run_dir = make_run_dir(
+        args.output_dir,
+        "operator",
+        args.dataset,
+        f"{args.model}_{args.method}_{args.regression_imitation_loss}_seed{args.seed}",
+    )
     print(f"[operator] run_dir={run_dir}")
     print(f"[operator] params={count_parameters(model)}")
 
@@ -138,13 +255,26 @@ def main():
     best_val_mse = float("inf")
 
     for epoch in range(1, args.epochs + 1):
+        effective_lambda = args.lambda_imitation
+        if args.method == "naive":
+            effective_lambda = 0.0
+        elif args.method == "studygroup" and epoch <= args.warmup_epochs:
+            effective_lambda = 0.0
+
         tr_mse = train_one_epoch(
             model,
-            _iter_limited(train_loader, args.max_train_batches),
+            peer_model,
+            train_loader,
             optimizer,
+            peer_optimizer,
             device,
+            supervised_loss_fn=supervised_loss_fn,
+            imitation_loss_fn=imitation_loss_fn,
+            lambda_imitation=effective_lambda,
+            margin=args.margin,
+            method=args.method,
         )
-        va_mse, va_mae = evaluate(model, _iter_limited(val_loader, args.max_val_batches), device)
+        va_mse, va_mae = evaluate(model, val_loader, device)
 
         train_mse_curve.append(tr_mse)
         val_mse_curve.append(va_mse)
@@ -185,7 +315,7 @@ def main():
             "dataset": args.dataset,
             "method": args.method,
             "model": args.model,
-            "peer_model": args.model,
+            "peer_model": args.model if peer_model is not None else None,
             "curve_mode": "single",
             "model_idx": 1,
             "regression_imitation_loss": args.regression_imitation_loss,

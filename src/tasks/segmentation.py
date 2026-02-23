@@ -9,6 +9,7 @@ import numpy as np
 import torch
 from PIL import Image, ImageFilter
 from torch.utils.data import DataLoader, Dataset
+import torchvision.datasets.voc as tv_voc
 from torchvision.datasets import Cityscapes, VOCSegmentation
 from torchvision.transforms import ColorJitter
 from torchvision.transforms import InterpolationMode
@@ -197,10 +198,10 @@ def _build_base_dataset(config: SegmentationDataConfig, dataset_name: str, train
 
     if name == "voc":
         split = config.voc_train_split if train else config.voc_val_split
-        base = VOCSegmentation(
-            root=str(root),
+        base = _build_voc_dataset(
+            root=root,
             year=config.voc_year,
-            image_set=split,
+            split=split,
             download=config.download_voc,
         )
         return base, _voc_mask_to_tensor, {
@@ -235,6 +236,67 @@ def _build_base_dataset(config: SegmentationDataConfig, dataset_name: str, train
     raise ValueError(f"Unsupported segmentation dataset: '{dataset_name}'")
 
 
+def _build_voc_dataset(root: Path, year: str, split: str, download: bool) -> VOCSegmentation:
+    root.mkdir(parents=True, exist_ok=True)
+    voc_root = root / "VOCdevkit" / f"VOC{year}"
+    if voc_root.exists():
+        return VOCSegmentation(
+            root=str(root),
+            year=year,
+            image_set=split,
+            download=False,
+        )
+    if not download:
+        return VOCSegmentation(
+            root=str(root),
+            year=year,
+            image_set=split,
+            download=False,
+        )
+
+    year_key = "2007-test" if year == "2007" and split == "test" else year
+    entry = dict(tv_voc.DATASET_YEAR_DICT[year_key])
+    archive_path = root / entry["filename"]
+    original_url = entry["url"]
+    url_candidates = []
+    if original_url.startswith("http://"):
+        url_candidates.append(original_url.replace("http://", "https://", 1))
+    url_candidates.append(original_url)
+
+    tried = set()
+    last_exc: Optional[RuntimeError] = None
+    for url in url_candidates:
+        if url in tried:
+            continue
+        tried.add(url)
+        tv_voc.DATASET_YEAR_DICT[year_key]["url"] = url
+        _unlink_if_exists(archive_path)
+        try:
+            return VOCSegmentation(
+                root=str(root),
+                year=year,
+                image_set=split,
+                download=True,
+            )
+        except RuntimeError as exc:
+            last_exc = exc
+            if "File not found or corrupted" in str(exc):
+                _unlink_if_exists(archive_path)
+                continue
+            raise
+        finally:
+            tv_voc.DATASET_YEAR_DICT[year_key]["url"] = original_url
+
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError("Failed to build VOC dataset for an unknown reason.")
+
+
+def _unlink_if_exists(path: Path) -> None:
+    if path.exists() and path.is_file():
+        path.unlink()
+
+
 def _resolve_cityscapes_root(city_root: Path) -> Path:
     left = city_root / "leftImg8bit"
     gt = city_root / "gtFine"
@@ -267,17 +329,19 @@ def _resolve_cityscapes_root(city_root: Path) -> Path:
 
 
 def _raw_mask_to_tensor(mask: Image.Image) -> torch.Tensor:
-    return torch.as_tensor(np.asarray(mask, dtype=np.uint8), dtype=torch.long)
+    mask_array = np.array(mask, dtype=np.uint8, copy=True)
+    return torch.tensor(mask_array, dtype=torch.long)
 
 
 def _voc_mask_to_tensor(mask: Image.Image) -> torch.Tensor:
-    return torch.as_tensor(np.asarray(mask, dtype=np.uint8), dtype=torch.long)
+    mask_array = np.array(mask, dtype=np.uint8, copy=True)
+    return torch.tensor(mask_array, dtype=torch.long)
 
 
 def _cityscapes_mask_to_train_id_tensor(mask: Image.Image) -> torch.Tensor:
-    raw_mask = np.asarray(mask, dtype=np.uint8)
-    remapped = CITYSCAPES_ID_TO_TRAIN_ID[raw_mask]
-    return torch.as_tensor(remapped, dtype=torch.long)
+    raw_mask = np.array(mask, dtype=np.uint8, copy=True)
+    remapped = np.array(CITYSCAPES_ID_TO_TRAIN_ID[raw_mask], copy=True)
+    return torch.tensor(remapped, dtype=torch.long)
 
 
 def _apply_resolution_shift(image: Image.Image, scale: float) -> Image.Image:

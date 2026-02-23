@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import copy
 from typing import Callable, Optional
 
 import torch
@@ -256,7 +255,12 @@ def main():
     peer_model = None
     peer_optimizer = None
     if args.method in {"dml", "studygroup"}:
-        peer_model = copy.deepcopy(model).to(device)
+        peer_model = build_classification_model(
+            model_name=args.model,
+            num_classes=num_classes,
+            in_channels=in_channels,
+            image_size=image_size,
+        ).to(device)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     if peer_model is not None:
