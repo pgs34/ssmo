@@ -124,59 +124,82 @@ def train_one_epoch(
         elif method == "dml":
             if peer_model is None or peer_optimizer is None:
                 raise ValueError("peer_model and peer_optimizer are required when method='dml'")
+        
+            # forward
             peer_pred = peer_model(x)
+        
+            # supervised losses
             peer_supervised_loss = supervised_loss_fn(peer_pred, y)
-
-            w_student = torch.relu(peer_supervised_loss.detach() - supervised_loss.detach() - margin)
-            sample_loss = imitation_loss_fn(pred, peer_pred)
-            student_weight_sum = w_student.sum()
-            imitation_term_student = (
-                (sample_loss * w_student).sum() / (student_weight_sum + 1e-12)
-                if float(student_weight_sum.item()) > 0.0
-                else sample_loss.new_tensor(0.0)
-            )
-            loss = supervised_loss.mean() + lambda_imitation * imitation_term_student
-
-            w_peer = torch.relu(supervised_loss.detach() - peer_supervised_loss.detach() - margin)
-            sample_loss_peer = imitation_loss_fn(peer_pred, pred)
-            peer_weight_sum = w_peer.sum()
-            imitation_term_peer = (
-                (sample_loss_peer * w_peer).sum() / (peer_weight_sum + 1e-12)
-                if float(peer_weight_sum.item()) > 0.0
-                else sample_loss_peer.new_tensor(0.0)
-            )
-            peer_loss = peer_supervised_loss.mean() + lambda_imitation * imitation_term_peer
-
-            (loss + peer_loss).backward()
+        
+            # imitation losses (symmetric, no weighting)
+            imitation_student = imitation_loss_fn(pred, peer_pred.detach())
+            imitation_peer = imitation_loss_fn(peer_pred, pred.detach())
+        
+            loss = supervised_loss.mean() + lambda_imitation * imitation_student.mean()
+            peer_loss = peer_supervised_loss.mean() + lambda_imitation * imitation_peer.mean()
+        
+            # backward
+            optimizer.zero_grad()
+            peer_optimizer.zero_grad()
+        
+            loss.backward()
+            peer_loss.backward()
+        
             optimizer.step()
             peer_optimizer.step()
 
         elif method == "studygroup":
-            if peer_model is None or peer_optimizer is None:
-                raise ValueError("peer_model and peer_optimizer are required when method='studygroup'")
+
             peer_pred = peer_model(x)
-            peer_supervised_loss = supervised_loss_fn(peer_pred, y)
-
-            w_student = ((peer_supervised_loss.detach() + margin) < supervised_loss.detach()).to(dtype=supervised_loss.dtype)
-            sample_loss = imitation_loss_fn(pred, peer_pred)
-            student_weight_sum = w_student.sum()
-            imitation_term_student = (
-                (sample_loss * w_student).sum() / (student_weight_sum + 1e-12)
-                if float(student_weight_sum.item()) > 0.0
-                else sample_loss.new_tensor(0.0)
+        
+            err_student = torch.abs(pred - y)
+            err_peer = torch.abs(peer_pred - y)
+        
+            sign_diff = torch.sign(pred - y) != torch.sign(peer_pred - y)
+        
+            student_better = err_peer < err_student
+            peer_better = err_student < err_peer
+        
+            mask_student = student_better & sign_diff
+            mask_peer = peer_better & sign_diff
+            mask_supervised = ~sign_diff
+        
+            # ---- student update ----
+            sup_elem = F.mse_loss(pred, y, reduction="none")
+            imit_elem = F.mse_loss(pred, peer_pred.detach(), reduction="none")
+        
+            supervised_term = (
+                sup_elem[mask_supervised].mean()
+                if mask_supervised.any()
+                else pred.new_tensor(0.0)
             )
-            loss = supervised_loss.mean() + lambda_imitation * imitation_term_student
-
-            w_peer = ((supervised_loss.detach() + margin) < peer_supervised_loss.detach()).to(dtype=peer_supervised_loss.dtype)
-            sample_loss_peer = imitation_loss_fn(peer_pred, pred)
-            peer_weight_sum = w_peer.sum()
+        
+            imitation_term = (
+                imit_elem[mask_student].mean()
+                if mask_student.any()
+                else pred.new_tensor(0.0)
+            )
+        
+            loss = supervised_term + lambda_imitation * imitation_term
+        
+            # ---- peer update ----
+            sup_elem_peer = F.mse_loss(peer_pred, y, reduction="none")
+            imit_elem_peer = F.mse_loss(peer_pred, pred.detach(), reduction="none")
+        
+            supervised_term_peer = (
+                sup_elem_peer[mask_supervised].mean()
+                if mask_supervised.any()
+                else pred.new_tensor(0.0)
+            )
+        
             imitation_term_peer = (
-                (sample_loss_peer * w_peer).sum() / (peer_weight_sum + 1e-12)
-                if float(peer_weight_sum.item()) > 0.0
-                else sample_loss_peer.new_tensor(0.0)
+                imit_elem_peer[mask_peer].mean()
+                if mask_peer.any()
+                else pred.new_tensor(0.0)
             )
-            peer_loss = peer_supervised_loss.mean() + lambda_imitation * imitation_term_peer
-
+        
+            peer_loss = supervised_term_peer + lambda_imitation * imitation_term_peer
+        
             (loss + peer_loss).backward()
             optimizer.step()
             peer_optimizer.step()
