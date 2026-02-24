@@ -38,6 +38,7 @@ for MODEL in $MODELS; do
             --lambda-imitation "$LAMBDA_IMITATION"
             --margin "$MARGIN"
             --warmup-epochs "$WARMUP_STUDYGROUP"
+            --download
           )
 
           "${CMD[@]}"

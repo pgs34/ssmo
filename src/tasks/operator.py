@@ -18,6 +18,7 @@ class OperatorDataConfig:
     pin_memory: bool = True
     seed: int = 0
     download: bool = True
+    split_train_ratio: float = 0.8
 
     burgers_file_name: str = "burgers_data_R10.mat"
     burgers_subsample_stride: int = 8
@@ -30,8 +31,6 @@ class OperatorDataConfig:
 
     darcy_train_resolution: int = 64
     darcy_test_resolution: int = 64
-    darcy_use_shift_split: bool = True
-    darcy_shift_split_ratio: float = 0.8
 
     navier_train_resolution: int = 128
     navier_test_resolution: int = 128
@@ -79,8 +78,18 @@ def _build_burgers(config: OperatorDataConfig):
             f"Requested n_train+n_test ({n_train+n_test}) exceeds dataset size ({x.shape[0]})."
         )
 
-    train_set = TensorDataset(x[:n_train], y[:n_train])
-    test_set = TensorDataset(x[n_train : n_train + n_test], y[n_train : n_train + n_test])
+    full_train_set = TensorDataset(x[:n_train], y[:n_train])
+
+    if config.split_train_ratio < 1.0:
+        train_set, val_set = _split_subset(
+            full_train_set,
+            split_ratio=config.split_train_ratio,
+            seed=config.seed,
+        )
+    else:
+        train_set = full_train_set
+        val_set = TensorDataset(x[n_train : n_train + n_test],
+                                y[n_train : n_train + n_test])
 
     train_loader = DataLoader(
         train_set,
@@ -89,8 +98,8 @@ def _build_burgers(config: OperatorDataConfig):
         num_workers=config.num_workers,
         pin_memory=config.pin_memory,
     )
-    test_loader = DataLoader(
-        test_set,
+    val_loader = DataLoader(
+        val_set,
         batch_size=config.batch_size,
         shuffle=False,
         num_workers=config.num_workers,
@@ -99,7 +108,7 @@ def _build_burgers(config: OperatorDataConfig):
 
     return {
         "train_loader": train_loader,
-        "val_loader": test_loader,
+        "val_loader": val_loader,
         "meta": {
             "dataset": "burgers",
             "in_channels": int(x.shape[1]),
@@ -124,36 +133,27 @@ def _build_darcy(config: OperatorDataConfig):
         download=config.download,
     )
 
-    if config.darcy_use_shift_split:
-        train_set, shifted_test_set = _split_subset(
-            dataset.train_db,
-            split_ratio=config.darcy_shift_split_ratio,
+    full_train_dataset = dataset.train_db
+    
+    if config.split_train_ratio < 1.0:
+        train_dataset, val_dataset = _split_subset(
+            full_train_dataset,
+            split_ratio=config.split_train_ratio,
             seed=config.seed,
         )
-        train_loader = DataLoader(
-            train_set,
-            batch_size=config.batch_size,
-            shuffle=True,
-            num_workers=config.num_workers,
-            pin_memory=config.pin_memory,
-        )
-        val_loader = DataLoader(
-            shifted_test_set,
-            batch_size=config.batch_size,
-            shuffle=False,
-            num_workers=config.num_workers,
-            pin_memory=config.pin_memory,
-        )
     else:
-        train_loader = DataLoader(
-            dataset.train_db,
+        train_dataset = full_train_dataset
+        val_dataset = test_dataset
+        
+    train_loader = DataLoader(
+            train_dataset,
             batch_size=config.batch_size,
             shuffle=True,
             num_workers=config.num_workers,
             pin_memory=config.pin_memory,
         )
-        val_loader = DataLoader(
-            dataset.test_dbs[config.darcy_test_resolution],
+    val_loader = DataLoader(
+            val_dataset,
             batch_size=config.batch_size,
             shuffle=False,
             num_workers=config.num_workers,
@@ -189,15 +189,28 @@ def _build_navier_stokes(config: OperatorDataConfig):
         download=config.download,
     )
 
+    full_train_dataset = dataset.train_db
+
+    if config.split_train_ratio < 1.0:
+        train_dataset, val_dataset = _split_subset(
+            full_train_dataset,
+            split_ratio=config.split_train_ratio,
+            seed=config.seed,
+        )
+    else:
+        train_dataset = full_train_dataset
+        val_dataset = test_dataset
+    
     train_loader = DataLoader(
-        dataset.train_db,
+        train_dataset,
         batch_size=config.batch_size,
         shuffle=True,
         num_workers=config.num_workers,
         pin_memory=config.pin_memory,
     )
+    
     val_loader = DataLoader(
-        dataset.test_dbs[config.navier_test_resolution],
+        val_dataset,
         batch_size=config.batch_size,
         shuffle=False,
         num_workers=config.num_workers,
