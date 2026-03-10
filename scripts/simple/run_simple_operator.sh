@@ -3,22 +3,34 @@ set -euo pipefail
 
 cd "$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
-METHODS="naive dml studygroup"
-DATASETS="darcy"
-SEEDS="0"
-MODELS="fno deeponet"
-EPOCHS="200"
-BATCH_SIZE="8"
-NUM_WORKERS="4"
-DEVICE="cuda"
-OUTPUT_DIR="results/run_simple"
+METHODS="${METHODS:-naive dml studygroup}"
+DATASETS="${DATASETS:-burgers darcy navier_stokes}"
+SEEDS="${SEEDS:-0}"
+if [[ -n "${MODELS:-}" && -z "${MODEL_PAIRS:-}" ]]; then
+  MODEL_PAIRS=""
+  for MODEL_NAME in $MODELS; do
+    MODEL_PAIRS+="${MODEL_NAME}:${MODEL_NAME} "
+  done
+fi
+MODEL_PAIRS="${MODEL_PAIRS:-fno:fno deeponet:deeponet fno:deeponet}"
+EPOCHS="${EPOCHS:-200}"
+BATCH_SIZE="${BATCH_SIZE:-8}"
+NUM_WORKERS="${NUM_WORKERS:-4}"
+DEVICE="${DEVICE:-cuda}"
+OUTPUT_DIR="${OUTPUT_DIR:-results/run_simple}"
 
-REGRESSION_IMITATION_LOSSES="mse mae huber"
-LAMBDA_IMITATION="1.0"
-MARGIN="0.0"
-WARMUP_STUDYGROUP="5"
+REGRESSION_IMITATION_LOSSES="${REGRESSION_IMITATION_LOSSES:-mse}"
+LAMBDA_IMITATION="${LAMBDA_IMITATION:-1.0}"
+MARGIN="${MARGIN:-0.0}"
+WARMUP_STUDYGROUP="${WARMUP_STUDYGROUP:-5}"
+DOWNLOAD_OPERATOR="${DOWNLOAD_OPERATOR:-0}"
 
-for MODEL in $MODELS; do
+for PAIR in $MODEL_PAIRS; do
+  IFS=':' read -r MODEL PEER_MODEL <<< "$PAIR"
+  if [[ -z "${PEER_MODEL:-}" ]]; then
+    PEER_MODEL="$MODEL"
+  fi
+
   for DATASET in $DATASETS; do
     for LOSS in $REGRESSION_IMITATION_LOSSES; do
       for METHOD in $METHODS; do
@@ -40,6 +52,13 @@ for MODEL in $MODELS; do
             --warmup-epochs "$WARMUP_STUDYGROUP"
             --download
           )
+
+          if [[ "$METHOD" != "naive" ]]; then
+            CMD+=(--peer-model "$PEER_MODEL")
+          fi
+          if [[ "$DOWNLOAD_OPERATOR" == "1" ]]; then
+            CMD+=(--download)
+          fi
 
           "${CMD[@]}"
         done

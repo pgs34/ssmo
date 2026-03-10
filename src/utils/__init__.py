@@ -1,6 +1,7 @@
 """Utility helpers for experiment runners."""
 
 from .common import (
+    append_jsonl,
     count_parameters,
     ensure_dir,
     make_run_dir,
@@ -11,6 +12,7 @@ from .common import (
 )
 
 __all__ = [
+    "append_jsonl",
     "count_parameters",
     "ensure_dir",
     "make_run_dir",

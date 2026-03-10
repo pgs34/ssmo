@@ -41,6 +41,12 @@ def save_json(path: str | Path, obj: dict[str, Any]) -> None:
         json.dump(obj, f, indent=2, ensure_ascii=False)
 
 
+def append_jsonl(path: str | Path, obj: dict[str, Any]) -> None:
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(obj, ensure_ascii=False))
+        f.write("\n")
+
+
 def save_curves(path: str | Path, **arrays) -> None:
     np_arrays = {k: np.asarray(v) for k, v in arrays.items()}
     np.savez(path, **np_arrays)

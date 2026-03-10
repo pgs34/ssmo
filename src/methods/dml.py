@@ -11,9 +11,14 @@ def directional_weights(
     valid_mask: torch.Tensor | None = None,
     margin: float = 0.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    # DML: emphasize mutual learning where the peer is currently better.
-    peer_advantage = supervised_2 - supervised_1 - margin
-    w_imitate_1 = torch.sigmoid(peer_advantage)
-    w_imitate_2 = torch.sigmoid(-peer_advantage)
     valid = to_weight_mask(supervised_1, valid_mask)
-    return w_imitate_1 * valid, w_imitate_2 * valid
+
+    # DML: apply a soft gate only where the peer is better than the student.
+    # The gate stays in [0, 1), so it sits between naive(=1 everywhere) and
+    # studygroup(=hard 0/1 selection).
+    def _soft_gate(advantage: torch.Tensor) -> torch.Tensor:
+        return torch.clamp(torch.sigmoid(advantage) * 2.0 - 1.0, min=0.0)
+
+    w_imitate_1 = _soft_gate(supervised_2 - supervised_1 - margin) * valid
+    w_imitate_2 = _soft_gate(supervised_1 - supervised_2 - margin) * valid
+    return w_imitate_1, w_imitate_2

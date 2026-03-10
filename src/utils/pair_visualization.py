@@ -111,6 +111,10 @@ def _make_row(
     warmup_epochs: int,
     lambda_imitation: float,
     margin: float,
+    mean_imitation_weight: float,
+    active_imitation_ratio: float,
+    supervised_loss_mean: float,
+    imitation_loss_mean: float,
     curve_mode: str,
     model_idx: int,
 ) -> dict[str, Any]:
@@ -128,6 +132,10 @@ def _make_row(
         "warmup_epochs": warmup_epochs,
         "lambda_imitation": lambda_imitation,
         "margin": margin,
+        "mean_imitation_weight": mean_imitation_weight,
+        "active_imitation_ratio": active_imitation_ratio,
+        "supervised_loss_mean": supervised_loss_mean,
+        "imitation_loss_mean": imitation_loss_mean,
         "curve_mode": curve_mode,
         "model_idx": model_idx,
         "run_dir": str(summary_path.parent),
@@ -183,6 +191,10 @@ def discover_rows(input_dir: Path) -> list[dict[str, Any]]:
                     warmup_epochs=warmup_epochs,
                     lambda_imitation=lambda_imitation,
                     margin=margin,
+                    mean_imitation_weight=_to_float(data.get("mean_imitation_weight")),
+                    active_imitation_ratio=_to_float(data.get("active_imitation_ratio")),
+                    supervised_loss_mean=_to_float(data.get("supervised_loss_mean")),
+                    imitation_loss_mean=_to_float(data.get("imitation_loss_mean")),
                     curve_mode=str(data.get("curve_mode", "single")),
                     model_idx=_to_int(data.get("model_idx", 1), 1),
                 )
@@ -211,6 +223,10 @@ def discover_rows(input_dir: Path) -> list[dict[str, Any]]:
                 warmup_epochs=warmup_epochs,
                 lambda_imitation=lambda_imitation,
                 margin=margin,
+                mean_imitation_weight=float("nan"),
+                active_imitation_ratio=float("nan"),
+                supervised_loss_mean=float("nan"),
+                imitation_loss_mean=float("nan"),
                 curve_mode="pair",
                 model_idx=1,
             )
@@ -231,6 +247,10 @@ def discover_rows(input_dir: Path) -> list[dict[str, Any]]:
                 warmup_epochs=warmup_epochs,
                 lambda_imitation=lambda_imitation,
                 margin=margin,
+                mean_imitation_weight=float("nan"),
+                active_imitation_ratio=float("nan"),
+                supervised_loss_mean=float("nan"),
+                imitation_loss_mean=float("nan"),
                 curve_mode="pair",
                 model_idx=2,
             )
@@ -256,13 +276,13 @@ def _mean_std(values: list[float]) -> tuple[float, float]:
 
 
 def aggregate_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    grouped: dict[tuple[str, str, str, str, str], list[dict[str, Any]]] = defaultdict(list)
+    grouped: dict[tuple[str, str, str, str, str, str], list[dict[str, Any]]] = defaultdict(list)
     for r in rows:
-        grouped[(r["task"], r["dataset"], r["model"], r["method"], r["metric_key"])].append(r)
+        grouped[(r["task"], r["dataset"], r["model"], r["peer_model"], r["method"], r["metric_key"])].append(r)
 
     out: list[dict[str, Any]] = []
     for key, items in grouped.items():
-        task, dataset, model, method, metric_key = key
+        task, dataset, model, peer_model, method, metric_key = key
         vals = [float(i["best_metric"]) for i in items]
         mean_val, std_val = _mean_std(vals)
         out.append(
@@ -270,6 +290,7 @@ def aggregate_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "task": task,
                 "dataset": dataset,
                 "model": model,
+                "peer_model": peer_model,
                 "method": method,
                 "metric_key": metric_key,
                 "n_runs": len(items),
@@ -283,6 +304,7 @@ def aggregate_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             r["task"],
             r["dataset"],
             r["model"],
+            r["peer_model"],
             METHOD_ORDER.get(r["method"], 99),
             r["method"],
         )
@@ -291,13 +313,13 @@ def aggregate_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def best_methods(agg_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    grouped: dict[tuple[str, str, str, str], list[dict[str, Any]]] = defaultdict(list)
+    grouped: dict[tuple[str, str, str, str, str], list[dict[str, Any]]] = defaultdict(list)
     for r in agg_rows:
-        grouped[(r["task"], r["dataset"], r["model"], r["metric_key"])].append(r)
+        grouped[(r["task"], r["dataset"], r["model"], r["peer_model"], r["metric_key"])].append(r)
 
     out: list[dict[str, Any]] = []
     for key, items in grouped.items():
-        task, dataset, model, metric_key = key
+        task, dataset, model, peer_model, metric_key = key
         maximize = metric_key in MAXIMIZE_METRICS
 
         def metric_value(x: dict[str, Any]) -> float:
@@ -312,6 +334,7 @@ def best_methods(agg_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 "task": task,
                 "dataset": dataset,
                 "model": model,
+                "peer_model": peer_model,
                 "metric_key": metric_key,
                 "direction": "maximize" if maximize else "minimize",
                 "best_method": best_item["method"],
@@ -319,12 +342,18 @@ def best_methods(agg_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             }
         )
 
-    out.sort(key=lambda r: (r["task"], r["dataset"], r["model"]))
+    out.sort(key=lambda r: (r["task"], r["dataset"], r["model"], r["peer_model"]))
     return out
 
 
-def _model_root(output_dir: Path, task: str, dataset: str, model: str) -> Path:
-    return output_dir / _slug(task) / _slug(dataset) / _slug(model)
+def _pair_tag(model: str, peer_model: str) -> str:
+    if not peer_model or peer_model == model:
+        return model
+    return f"{model}__{peer_model}"
+
+
+def _model_root(output_dir: Path, task: str, dataset: str, model: str, peer_model: str) -> Path:
+    return output_dir / _slug(task) / _slug(dataset) / _slug(_pair_tag(model, peer_model))
 
 
 def save_metric_bar_plots(agg_rows: list[dict[str, Any]], output_dir: Path) -> int:
@@ -332,14 +361,14 @@ def save_metric_bar_plots(agg_rows: list[dict[str, Any]], output_dir: Path) -> i
         print("[VIS][warn] matplotlib unavailable; CSV only.")
         return 0
 
-    grouped: dict[tuple[str, str, str, str], list[dict[str, Any]]] = defaultdict(list)
+    grouped: dict[tuple[str, str, str, str, str], list[dict[str, Any]]] = defaultdict(list)
     for r in agg_rows:
-        grouped[(r["task"], r["dataset"], r["model"], r["metric_key"])].append(r)
+        grouped[(r["task"], r["dataset"], r["model"], r["peer_model"], r["metric_key"])].append(r)
 
     count = 0
     for key, items in grouped.items():
-        task, dataset, model, metric_key = key
-        model_root = _model_root(output_dir, task, dataset, model)
+        task, dataset, model, peer_model, metric_key = key
+        model_root = _model_root(output_dir, task, dataset, model, peer_model)
         model_root.mkdir(parents=True, exist_ok=True)
 
         items.sort(key=lambda r: (METHOD_ORDER.get(r["method"], 99), r["method"]))
@@ -353,7 +382,7 @@ def save_metric_bar_plots(agg_rows: list[dict[str, Any]], output_dir: Path) -> i
         ax.set_xticks(x)
         ax.set_xticklabels(methods, rotation=15, ha="right")
         ax.set_ylabel(metric_key)
-        ax.set_title(f"{task} | {dataset} | {model}")
+        ax.set_title(f"{task} | {dataset} | {_pair_tag(model, peer_model)}")
         ax.grid(axis="y", alpha=0.3)
         fig.tight_layout()
 
@@ -405,14 +434,14 @@ def save_loss_curve_plots(rows: list[dict[str, Any]], output_dir: Path) -> int:
     if not HAS_MATPLOTLIB:
         return 0
 
-    grouped: dict[tuple[str, str, str, int], list[dict[str, Any]]] = defaultdict(list)
+    grouped: dict[tuple[str, str, str, str, int], list[dict[str, Any]]] = defaultdict(list)
     for row in rows:
-        grouped[(row["task"], row["dataset"], row["model"], row["seed"])].append(row)
+        grouped[(row["task"], row["dataset"], row["model"], row["peer_model"], row["seed"])].append(row)
 
     count = 0
     for key, items in grouped.items():
-        task, dataset, model, seed = key
-        model_root = _model_root(output_dir, task, dataset, model)
+        task, dataset, model, peer_model, seed = key
+        model_root = _model_root(output_dir, task, dataset, model, peer_model)
         model_root.mkdir(parents=True, exist_ok=True)
 
         latest = _latest_rows_per_method(items)
@@ -482,7 +511,7 @@ def save_loss_curve_plots(rows: list[dict[str, Any]], output_dir: Path) -> int:
         ax_train.legend(fontsize=8)
         ax_test.legend(fontsize=8)
 
-        fig.suptitle(f"{task} | {dataset} | {model} | seed={seed}", fontsize=12)
+        fig.suptitle(f"{task} | {dataset} | {_pair_tag(model, peer_model)} | seed={seed}", fontsize=12)
         fig.tight_layout(rect=[0, 0, 1, 0.95])
 
         fig.savefig(model_root / f"seed{seed}__train_test_loss_by_method.png", dpi=160)
@@ -498,8 +527,8 @@ def clear_plot_outputs(rows: list[dict[str, Any]], output_dir: Path) -> None:
     for row in rows:
         task = _slug(row["task"])
         dataset = _slug(row["dataset"])
-        model = _slug(row["model"])
-        model_dirs.add(output_dir / task / dataset / model)
+        pair_tag = _slug(_pair_tag(str(row["model"]), str(row["peer_model"])))
+        model_dirs.add(output_dir / task / dataset / pair_tag)
         legacy_dataset_dirs.add(output_dir / f"{task}_pair" / dataset)
 
     legacy_plots_dir = output_dir / "plots"
@@ -551,6 +580,10 @@ def visualize_pair_results(input_dir: str | Path, output_dir: str | Path) -> dic
         "warmup_epochs",
         "lambda_imitation",
         "margin",
+        "mean_imitation_weight",
+        "active_imitation_ratio",
+        "supervised_loss_mean",
+        "imitation_loss_mean",
         "curve_mode",
         "model_idx",
         "run_dir",
@@ -563,6 +596,7 @@ def visualize_pair_results(input_dir: str | Path, output_dir: str | Path) -> dic
         "task",
         "dataset",
         "model",
+        "peer_model",
         "method",
         "metric_key",
         "n_runs",
@@ -576,6 +610,7 @@ def visualize_pair_results(input_dir: str | Path, output_dir: str | Path) -> dic
         "task",
         "dataset",
         "model",
+        "peer_model",
         "metric_key",
         "direction",
         "best_method",

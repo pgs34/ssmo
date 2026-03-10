@@ -13,8 +13,8 @@ SWEEP_OUTPUT_DIR="results/sweep/classification/hyper_parameter"
 echo "[CONFIG] task=classification_sweep"
 echo "[CONFIG] class_losses=${CLASS_LOSSES[*]}"
 echo "[CONFIG] lambdas=${LAMBDAS[*]} margins=${MARGINS[*]} warmups=${WARMUPS[*]}"
-echo "[CONFIG] methods=naive dml studygroup datasets=mnist cifar10 cifar100"
-echo "[CONFIG] models=resnet18 vit_b16 simple_cnn"
+echo "[CONFIG] methods=naive dml studygroup datasets=cifar10 cifar100"
+echo "[CONFIG] model_pairs=resnet18:resnet18 resnet18:vit_b16"
 echo "[CONFIG] seeds=0 1 2 3 4 epochs=120 batch_size=128 device=cuda"
 echo "[CONFIG] output_dir=$SWEEP_OUTPUT_DIR"
 
@@ -28,8 +28,9 @@ for loss in "${CLASS_LOSSES[@]}"; do
         MARGIN="$margin" \
         WARMUP_STUDYGROUP="$warmup" \
         METHODS="naive dml studygroup" \
-        DATASETS="mnist cifar10 cifar100" \
-        MODELS="resnet18 vit_b16 simple_cnn" \
+        DATASETS="cifar10 cifar100" \
+        MODEL_PAIRS="resnet18:resnet18 resnet18:vit_b16" \
+        LABEL_NOISE_CONDITIONS="none:0.0 symmetric:0.2 symmetric:0.4 symmetric:0.6 asymmetric:0.2 asymmetric:0.4 asymmetric:0.6" \
         SEEDS="0 1 2 3 4" \
         EPOCHS="120" \
         BATCH_SIZE="128" \

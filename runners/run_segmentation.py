@@ -12,13 +12,15 @@ from src.tasks import SegmentationDataConfig, build_segmentation_dataloaders
 from src.utils import count_parameters, make_run_dir, save_curves, save_json, save_live_loss_plot, set_seed
 
 IGNORE_INDEX = 255
+SEGMENTATION_MODEL_CHOICES = ["unet", "deeplabv3_resnet50"]
 
 
 def parse_args():
     p = argparse.ArgumentParser(description="Run semantic segmentation experiment")
     p.add_argument("--train-dataset", type=str, default="voc", choices=["voc", "cityscapes"])
     p.add_argument("--val-dataset", type=str, default="voc", choices=["voc", "cityscapes"])
-    p.add_argument("--model", type=str, default="unet", choices=["unet", "deeplabv3_resnet50"])
+    p.add_argument("--model", type=str, default="unet", choices=SEGMENTATION_MODEL_CHOICES)
+    p.add_argument("--peer-model", type=str, default=None, choices=SEGMENTATION_MODEL_CHOICES)
     p.add_argument("--method", type=str, default="dml", choices=["naive", "dml", "studygroup"])
     p.add_argument("--epochs", type=int, default=20)
     p.add_argument("--batch-size", type=int, default=8)
@@ -256,11 +258,16 @@ def main():
     in_channels = int(sample_x.shape[1])
     num_classes = int(val_meta["num_classes"])
 
+    peer_model_name = args.peer_model or args.model
     model = build_segmentation_model(args.model, num_classes=num_classes, in_channels=in_channels).to(device)
     peer_model = None
     peer_optimizer = None
     if args.method in {"dml", "studygroup"}:
-        peer_model = build_segmentation_model(args.model, num_classes=num_classes, in_channels=in_channels).to(device)
+        peer_model = build_segmentation_model(
+            peer_model_name,
+            num_classes=num_classes,
+            in_channels=in_channels,
+        ).to(device)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     if peer_model is not None:
@@ -268,11 +275,12 @@ def main():
     imitation_loss_fn = build_segmentation_imitation_loss_fn(args.segmentation_imitation_loss)
 
     dataset_tag = f"{args.train_dataset}_to_{args.val_dataset}"
+    pair_tag = args.model if peer_model_name == args.model else f"{args.model}__{peer_model_name}"
     run_dir = make_run_dir(
         args.output_dir,
         "segmentation",
         dataset_tag,
-        f"{args.model}_{args.method}_{args.segmentation_imitation_loss}_seed{args.seed}",
+        f"{pair_tag}_{args.method}_{args.segmentation_imitation_loss}_seed{args.seed}",
     )
     print(f"[segmentation] run_dir={run_dir}")
     print(f"[segmentation] params={count_parameters(model)}")
@@ -353,7 +361,7 @@ def main():
             "val_dataset": args.val_dataset,
             "method": args.method,
             "model": args.model,
-            "peer_model": args.model if peer_model is not None else None,
+            "peer_model": peer_model_name if peer_model is not None else None,
             "curve_mode": "single",
             "model_idx": 1,
             "segmentation_imitation_loss": args.segmentation_imitation_loss,

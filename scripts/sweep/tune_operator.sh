@@ -14,7 +14,7 @@ echo "[CONFIG] task=operator_sweep"
 echo "[CONFIG] reg_losses=${REG_LOSSES[*]}"
 echo "[CONFIG] lambdas=${LAMBDAS[*]} margins=${MARGINS[*]} warmups=${WARMUPS[*]}"
 echo "[CONFIG] methods=dml studygroup datasets=darcy navier_stokes burgers"
-echo "[CONFIG] models=fno deeponet gnot"
+echo "[CONFIG] model_pairs=fno:fno deeponet:deeponet fno:deeponet"
 echo "[CONFIG] seeds=0 1 2 3 4 epochs=180 batch_size=16 device=cuda"
 echo "[CONFIG] output_dir=$SWEEP_OUTPUT_DIR"
 
@@ -29,7 +29,7 @@ for reg_loss in "${REG_LOSSES[@]}"; do
         WARMUP_STUDYGROUP="$warmup" \
         METHODS="dml studygroup" \
         DATASETS="darcy navier_stokes burgers" \
-        MODELS="fno deeponet gnot" \
+        MODEL_PAIRS="fno:fno deeponet:deeponet fno:deeponet" \
         SEEDS="0 1 2 3 4" \
         EPOCHS="180" \
         BATCH_SIZE="16" \

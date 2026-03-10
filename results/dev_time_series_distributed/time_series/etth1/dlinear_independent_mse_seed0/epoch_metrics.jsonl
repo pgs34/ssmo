@@ -1,0 +1,1 @@
+{"epoch": 1, "method": "independent", "model": "dlinear", "peer_model": null, "lambda_imitation": 0.0, "margin": 0.0, "train_total": 0.81613733943657, "supervised_loss_mean": 0.81613733943657, "imitation_loss_mean": 0.0, "mean_imitation_weight": 0.0, "active_imitation_ratio": 0.0, "val_mse": 0.5667648375866698, "val_mae": 0.5247233749955947}

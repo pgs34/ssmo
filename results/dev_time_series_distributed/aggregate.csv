@@ -1,0 +1,5 @@
+task,dataset,model,peer_model,method,metric_key,n_runs,mean_metric,std_metric
+time_series,etth1,dlinear,None,independent,mse,1,0.5667648375866698,0.0
+time_series,etth1,dlinear,dlinear,naive,mse,1,0.5640338294673993,0.0
+time_series,etth1,dlinear,dlinear,dml,mse,1,0.5667840396735475,0.0
+time_series,etth1,dlinear,dlinear,studygroup,mse,1,0.5649371779392036,0.0

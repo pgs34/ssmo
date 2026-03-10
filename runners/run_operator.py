@@ -10,6 +10,16 @@ from src.models.operator import build_operator_model
 from src.tasks.operator import OperatorDataConfig, build_operator_dataloaders
 from src.utils import count_parameters, make_run_dir, save_curves, save_json, save_live_loss_plot, set_seed
 
+OPERATOR_MODEL_CHOICES = [
+    "fno",
+    "deeponet",
+    "gnot",
+    "neuralop_fno",
+    "neuralop_tfno",
+    "neuralop_uno",
+    "uno",
+]
+
 
 def parse_args():
     p = argparse.ArgumentParser(description="Run operator-learning experiment")
@@ -18,15 +28,13 @@ def parse_args():
         "--model",
         type=str,
         default="fno",
-        choices=[
-            "fno",
-            "deeponet",
-            "gnot",
-            "neuralop_fno",
-            "neuralop_tfno",
-            "neuralop_uno",
-            "uno",
-        ],
+        choices=OPERATOR_MODEL_CHOICES,
+    )
+    p.add_argument(
+        "--peer-model",
+        type=str,
+        default=None,
+        choices=OPERATOR_MODEL_CHOICES,
     )
     p.add_argument("--method", type=str, default="dml", choices=["naive", "dml", "studygroup"])
     p.add_argument("--epochs", type=int, default=20)
@@ -251,23 +259,25 @@ def main():
     val_loader = data["val_loader"]
     meta = data["meta"]
 
+    peer_model_name = args.peer_model or args.model
     model = build_operator_model(args.model, args.dataset, meta).to(device)
     peer_model = None
     peer_optimizer = None
     if args.method in {"dml", "studygroup"}:
-        peer_model = build_operator_model(args.model, args.dataset, meta).to(device)
+        peer_model = build_operator_model(peer_model_name, args.dataset, meta).to(device)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     if peer_model is not None:
         peer_optimizer = torch.optim.AdamW(peer_model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     supervised_loss_fn = build_regression_imitation_loss_fn("mse")
     imitation_loss_fn = build_regression_imitation_loss_fn(args.regression_imitation_loss)
+    pair_tag = args.model if peer_model_name == args.model else f"{args.model}__{peer_model_name}"
 
     run_dir = make_run_dir(
         args.output_dir,
         "operator",
         args.dataset,
-        f"{args.model}_{args.method}_{args.regression_imitation_loss}_seed{args.seed}",
+        f"{pair_tag}_{args.method}_{args.regression_imitation_loss}_seed{args.seed}",
     )
     print(f"[operator] run_dir={run_dir}")
     print(f"[operator] params={count_parameters(model)}")
@@ -338,7 +348,7 @@ def main():
             "dataset": args.dataset,
             "method": args.method,
             "model": args.model,
-            "peer_model": args.model if peer_model is not None else None,
+            "peer_model": peer_model_name if peer_model is not None else None,
             "curve_mode": "single",
             "model_idx": 1,
             "regression_imitation_loss": args.regression_imitation_loss,

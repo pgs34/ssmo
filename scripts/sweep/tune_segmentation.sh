@@ -13,8 +13,8 @@ SWEEP_OUTPUT_DIR="results/sweep/segmentation/hyper_parameter"
 echo "[CONFIG] task=segmentation_sweep"
 echo "[CONFIG] seg_losses=${SEG_LOSSES[*]}"
 echo "[CONFIG] lambdas=${LAMBDAS[*]} margins=${MARGINS[*]} warmups=${WARMUPS[*]}"
-echo "[CONFIG] methods=dml studygroup models=unet deeplabv3_resnet50"
-echo "[CONFIG] include_cityscapes=1 seeds=0 1 2"
+echo "[CONFIG] methods=dml studygroup model_pairs=unet:unet deeplabv3_resnet50:deeplabv3_resnet50 unet:deeplabv3_resnet50"
+echo "[CONFIG] dataset_pairs=voc:voc voc:cityscapes seeds=0 1 2"
 echo "[CONFIG] epochs=100 batch_size=8 device=cuda"
 echo "[CONFIG] output_dir=$SWEEP_OUTPUT_DIR"
 
@@ -28,8 +28,9 @@ for seg_loss in "${SEG_LOSSES[@]}"; do
         MARGIN="$margin" \
         WARMUP_STUDYGROUP="$warmup" \
         METHODS="dml studygroup" \
-        MODELS="unet deeplabv3_resnet50" \
-        INCLUDE_CITYSCAPES="1" \
+        MODEL_PAIRS="unet:unet deeplabv3_resnet50:deeplabv3_resnet50 unet:deeplabv3_resnet50" \
+        DATASET_PAIRS="voc:voc voc:cityscapes" \
+        VAL_CONDITIONS="none:1:1.0 gaussian_noise:3:1.0 none:1:0.75" \
         SEEDS="0 1 2" \
         EPOCHS="100" \
         BATCH_SIZE="8" \

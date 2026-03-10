@@ -10,11 +10,14 @@ from src.models import build_classification_model
 from src.tasks import ClassificationDataConfig, build_classification_dataloaders
 from src.utils import count_parameters, make_run_dir, save_curves, save_json, save_live_loss_plot, set_seed
 
+CLASSIFICATION_MODEL_CHOICES = ["simple_cnn", "simple_mlp", "resnet18", "vit_b16"]
+
 
 def parse_args():
     p = argparse.ArgumentParser(description="Run classification experiment")
     p.add_argument("--dataset", type=str, default="cifar10", choices=["mnist", "cifar10", "cifar100"])
-    p.add_argument("--model", type=str, default="resnet18", choices=["simple_cnn", "simple_mlp", "resnet18", "vit_b16"])
+    p.add_argument("--model", type=str, default="resnet18", choices=CLASSIFICATION_MODEL_CHOICES)
+    p.add_argument("--peer-model", type=str, default=None, choices=CLASSIFICATION_MODEL_CHOICES)
     p.add_argument(
         "--method",
         type=str,
@@ -246,6 +249,7 @@ def main():
     in_channels = int(sample_x.shape[1])
     image_size = int(sample_x.shape[-1])
 
+    peer_model_name = args.peer_model or args.model
     model = build_classification_model(
         model_name=args.model,
         num_classes=num_classes,
@@ -256,7 +260,7 @@ def main():
     peer_optimizer = None
     if args.method in {"dml", "studygroup"}:
         peer_model = build_classification_model(
-            model_name=args.model,
+            model_name=peer_model_name,
             num_classes=num_classes,
             in_channels=in_channels,
             image_size=image_size,
@@ -266,11 +270,12 @@ def main():
     if peer_model is not None:
         peer_optimizer = torch.optim.AdamW(peer_model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
+    pair_tag = args.model if peer_model_name == args.model else f"{args.model}__{peer_model_name}"
     run_dir = make_run_dir(
         args.output_dir,
         "classification",
         args.dataset,
-        f"{args.model}_{args.method}_{args.classification_imitation_loss}_seed{args.seed}",
+        f"{pair_tag}_{args.method}_{args.classification_imitation_loss}_seed{args.seed}",
     )
     print(f"[classification] run_dir={run_dir}")
     print(f"[classification] params={count_parameters(model)}")
@@ -350,7 +355,7 @@ def main():
             "dataset": args.dataset,
             "method": args.method,
             "model": args.model,
-            "peer_model": args.model if peer_model is not None else None,
+            "peer_model": peer_model_name if peer_model is not None else None,
             "curve_mode": "single",
             "model_idx": 1,
             "classification_imitation_loss": args.classification_imitation_loss,
