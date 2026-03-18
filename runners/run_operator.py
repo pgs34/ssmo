@@ -157,60 +157,47 @@ def train_one_epoch(
             peer_optimizer.step()
 
         elif method == "studygroup":
-
+            # 1. 두 모델의 예측 (Forward)
+            pred = model(x)
             peer_pred = peer_model(x)
-        
+            
+            # 2. Studygroup 조건 생성을 위한 오차 및 부호 계산
             err_student = torch.abs(pred - y)
             err_peer = torch.abs(peer_pred - y)
-        
+            
+            # 부호가 다르면 서로 타겟(y)을 사이에 두고 반대편에 있는 것임
             sign_diff = torch.sign(pred - y) != torch.sign(peer_pred - y)
-        
-            student_better = err_peer < err_student
-            peer_better = err_student < err_peer
-        
-            mask_student = student_better & sign_diff
-            mask_peer = peer_better & sign_diff
-            mask_supervised = ~sign_diff
-        
-            # ---- student update ----
-            sup_elem = F.mse_loss(pred, y, reduction="none")
-            imit_elem = F.mse_loss(pred, peer_pred.detach(), reduction="none")
-        
-            supervised_term = (
-                sup_elem[mask_supervised].mean()
-                if mask_supervised.any()
-                else pred.new_tensor(0.0)
-            )
-        
-            imitation_term = (
-                imit_elem[mask_student].mean()
-                if mask_student.any()
-                else pred.new_tensor(0.0)
-            )
-        
-            loss = supervised_term + lambda_imitation * imitation_term
-        
-            # ---- peer update ----
-            sup_elem_peer = F.mse_loss(peer_pred, y, reduction="none")
-            imit_elem_peer = F.mse_loss(peer_pred, pred.detach(), reduction="none")
-        
-            supervised_term_peer = (
-                sup_elem_peer[mask_supervised].mean()
-                if mask_supervised.any()
-                else pred.new_tensor(0.0)
-            )
-        
-            imitation_term_peer = (
-                imit_elem_peer[mask_peer].mean()
-                if mask_peer.any()
-                else pred.new_tensor(0.0)
-            )
-        
-            peer_loss = supervised_term_peer + lambda_imitation * imitation_term_peer
-        
-            (loss + peer_loss).backward()
+            
+            # 3. 마스크 생성 (차원에 관계없이 모든 엘리먼트에 적용 가능)
+            mask_student_imitate = (err_peer < err_student) & sign_diff
+            mask_peer_imitate = (err_student < err_peer) & sign_diff
+            mask_supervised = ~sign_diff # 부호가 같으면(방향이 같으면) 타겟 학습
+            
+            # 4. Student 손실 계산
+            sup_student = F.mse_loss(pred, y, reduction="none")
+            imit_student = F.mse_loss(pred, peer_pred.detach(), reduction="none")
+            
+            loss_student = (sup_student[mask_supervised].mean() if mask_supervised.any() else 0.0) + \
+                           lambda_imitation * (imit_student[mask_student_imitate].mean() if mask_student_imitate.any() else 0.0)
+            
+            # 5. Peer 손실 계산
+            sup_peer = F.mse_loss(peer_pred, y, reduction="none")
+            imit_peer = F.mse_loss(peer_pred, pred.detach(), reduction="none")
+            
+            loss_peer = (sup_peer[mask_supervised].mean() if mask_supervised.any() else 0.0) + \
+                        lambda_imitation * (imit_peer[mask_peer_imitate].mean() if mask_peer_imitate.any() else 0.0)
+
+            # 6. 두 모델 동시 업데이트
+            optimizer.zero_grad()
+            peer_optimizer.zero_grad()
+            
+            total_combined_loss = loss_student + loss_peer
+            total_combined_loss.backward()
+            
             optimizer.step()
             peer_optimizer.step()
+            
+            loss = loss_student # 로그 기록용
 
         else:
             raise ValueError(f"Unsupported method '{method}'")
