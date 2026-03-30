@@ -1,3 +1,0 @@
-task,dataset,model,peer_model,metric_key,direction,best_method,best_mean_metric
-time_series,etth1,dlinear,None,mse,minimize,independent,0.5667648375866698
-time_series,etth1,dlinear,dlinear,mse,minimize,naive,0.5640338294673993
