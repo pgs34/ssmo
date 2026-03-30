@@ -10,9 +10,12 @@ from .common import (
     save_json,
     set_seed,
 )
+from .pairing import build_pair_metadata, canonicalize_method_name, uses_peer_model
 
 __all__ = [
     "append_jsonl",
+    "build_pair_metadata",
+    "canonicalize_method_name",
     "count_parameters",
     "ensure_dir",
     "make_run_dir",
@@ -20,4 +23,5 @@ __all__ = [
     "save_curves",
     "save_json",
     "set_seed",
+    "uses_peer_model",
 ]

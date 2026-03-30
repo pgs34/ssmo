@@ -212,3 +212,28 @@ results/experiments/
 results/experiments_pair/
 results/run_simple/
 results/sweep/
+
+# Local summary plots and debug images
+Results_Plots/
+test_error_*.png
+
+# Notebook-generated local artifacts
+.DS_Store
+notebook/**/.ipynb_checkpoints/
+notebook/2026-03-18_wrapup/figures/
+notebook/2026-03-18_wrapup/tables/
+notebook/FINAL_WRAPUP/figures/
+notebook/FINAL_WRAPUP/tables/
+notebook/results_from_pks/
+
+# Generated experiment outputs from ad-hoc reruns
+results/plots/
+results/**/model.pt
+results/**/peer_model.pt
+results/**/best_model.pt
+results/**/best_peer_model.pt
+results/**/curves.npz
+results/**/summary.json
+results/**/epoch_metrics.jsonl
+results/**/*.log
+results/**/*_by_method.png

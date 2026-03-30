@@ -14,8 +14,7 @@ def directional_weights(
     valid = to_weight_mask(supervised_1, valid_mask)
 
     # DML: apply a soft gate only where the peer is better than the student.
-    # The gate stays in [0, 1), so it sits between naive(=1 everywhere) and
-    # studygroup(=hard 0/1 selection).
+    # The gate stays in [0, 1), unlike SSML's hard 0/1 selection.
     def _soft_gate(advantage: torch.Tensor) -> torch.Tensor:
         return torch.clamp(torch.sigmoid(advantage) * 2.0 - 1.0, min=0.0)
 

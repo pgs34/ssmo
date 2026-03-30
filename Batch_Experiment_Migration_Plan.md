@@ -53,14 +53,12 @@ Done criteria:
 src/
   methods/
     independent.py
-    naive_mutual.py
-    ssmo_hard.py
-    ssmo_soft.py
+    dml.py
+    ssml.py
   tasks/
     classification.py
     operator.py
     time_series.py
-    segmentation.py
   utils/
     seed.py
     io.py
@@ -70,7 +68,6 @@ src/
     classification/
     operator/
     time_series/
-    segmentation/
 runners/
   run_single.py
   run_pair.py
@@ -79,7 +76,7 @@ runners/
 
 Done criteria:
 - `python -m runners.sweep --help` 호출 가능.
-- 4개 태스크(`classification`, `operator`, `time_series`, `segmentation`) 모두 동일 인터페이스로 실행 가능.
+- 3개 태스크(`classification`, `operator`, `time_series`) 모두 동일 인터페이스로 실행 가능.
 
 ### Step 2. Notebook logic extraction
 
@@ -92,8 +89,8 @@ Done criteria:
 3. 중복 제거:
 - Burgers/Darcy의 공통 trainer 합치기
 - MNIST/CIFAR의 공통 분류 trainer 합치기
-4. 4개 태스크 정렬:
-- time-series/segmentation용 dataset adapter와 method hook 포인트를 classification/operator와 같은 수준으로 구현
+4. 3개 태스크 정렬:
+- time-series용 dataset adapter와 method hook 포인트를 classification/operator와 같은 수준으로 구현
 
 Done criteria:
 - 노트북 없이 동일 태스크 1회 학습 실행 가능.
@@ -103,9 +100,8 @@ Done criteria:
 방법 축을 공통 인터페이스로 통일한다.
 
 1. `Independent`
-2. `Naive mutual` (imitation always ON)
-3. `SSMO-hard` (loss 비교 기반 hard mask)
-4. `SSMO-soft` (sigmoid gating, 옵션)
+2. `DML` (dense mutual imitation)
+3. `SSML` (loss 비교 기반 selective imitation)
 
 Done criteria:
 - method 교체가 config의 문자열 변경만으로 가능.

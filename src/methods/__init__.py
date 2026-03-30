@@ -1,13 +1,12 @@
 from __future__ import annotations
 
-from . import dml, independent, naive, studygroup
+from . import dml, independent, ssml
 from .common import mask_activation_ratio, weighted_mean
 
 METHODS = {
     "independent": independent.directional_weights,
-    "naive": naive.directional_weights,
     "dml": dml.directional_weights,
-    "studygroup": studygroup.directional_weights,
+    "ssml": ssml.directional_weights,
 }
 
 

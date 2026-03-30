@@ -14,7 +14,7 @@ SWEEP_OUTPUT_DIR="results/sweep/time_series/hyper_parameter"
 echo "[CONFIG] task=time_series_sweep"
 echo "[CONFIG] reg_losses=${REG_LOSSES[*]}"
 echo "[CONFIG] lambdas=${LAMBDAS[*]} margins=${MARGINS[*]} pred_lens=${PRED_LENS[*]} warmups=${WARMUPS[*]}"
-echo "[CONFIG] methods=dml studygroup datasets=etth1 electricity weather"
+echo "[CONFIG] methods=dml ssml datasets=etth1 electricity weather"
 echo "[CONFIG] model_pairs=transformer:transformer dlinear:dlinear transformer:dlinear"
 echo "[CONFIG] seeds=0 1 2 3 4 epochs=80 batch_size=64 device=cuda"
 echo "[CONFIG] output_dir=$SWEEP_OUTPUT_DIR"
@@ -28,9 +28,9 @@ for reg_loss in "${REG_LOSSES[@]}"; do
           REGRESSION_IMITATION_LOSSES="$reg_loss" \
           LAMBDA_IMITATION="$lambda_imitation" \
           MARGIN="$margin" \
-          WARMUP_STUDYGROUP="$warmup" \
+          WARMUP_EPOCHS="$warmup" \
           PRED_LENS="$pred_len" \
-          METHODS="dml studygroup" \
+          METHODS="dml ssml" \
           DATASETS="etth1 electricity weather" \
           MODEL_PAIRS="transformer:transformer dlinear:dlinear transformer:dlinear" \
           SEEDS="0 1 2 3 4" \

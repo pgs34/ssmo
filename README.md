@@ -1,6 +1,6 @@
 # ssml
 
-Selective-Supervised Mutual Operator Learning (SSMO/SSML) 실험 리포지토리입니다.
+Selective-Supervised Mutual Learning (SSML) 실험 리포지토리입니다.
 
 ## Project Structure
 
@@ -12,7 +12,6 @@ Selective-Supervised Mutual Operator Learning (SSMO/SSML) 실험 리포지토리
   - `run_classification.py`
   - `run_operator.py`
   - `run_time_series.py`
-  - `run_segmentation.py`
   - `sweep.py` (task/dataset/model 매트릭스 일괄 실행)
 - `models/`: 기존 코어 연산자 모델 구현(FNO/DeepONet/GNOT)
 - `notebook/`: 기존 노트북 자산
@@ -26,7 +25,6 @@ Selective-Supervised Mutual Operator Learning (SSMO/SSML) 실험 리포지토리
 | Classification | `mnist`, `cifar10`, `cifar100` | `simple_cnn`, `simple_mlp`, `resnet18`, `vit_b16` |
 | Operator learning | `burgers`, `darcy`, `navier_stokes` | `fno`, `deeponet`, `gnot`, `neuralop_fno`, `neuralop_tfno`, `neuralop_uno`(2D only) |
 | Time-series forecasting | `etth1`, `etth2`, `ettm1`, `ettm2`, `electricity`, `weather`, `traffic`, `exchange_rate`, `illness` | `dlinear`, `transformer` |
-| Semantic segmentation | `voc`, `cityscapes` | `unet`, `deeplabv3_resnet50` |
 
 ## Data Layout
 
@@ -45,9 +43,6 @@ Selective-Supervised Mutual Operator Learning (SSMO/SSML) 실험 리포지토리
   - `data/time_series/traffic/traffic.csv`
   - `data/time_series/exchange_rate/exchange_rate.csv`
   - `data/time_series/illness/national_illness.csv`
-- Segmentation:
-  - VOC: `--download-voc`
-  - Cityscapes: `data/cityscapes/leftImg8bit/...`, `data/cityscapes/gtFine/...`
 
 ## Run Commands
 
@@ -57,7 +52,6 @@ Selective-Supervised Mutual Operator Learning (SSMO/SSML) 실험 리포지토리
 python -m runners.run_classification --dataset cifar10 --model resnet18 --epochs 20 --batch-size 128 --seed 0 --device cuda --download
 python -m runners.run_operator --dataset darcy --model neuralop_fno --epochs 20 --batch-size 16 --seed 0 --device cuda --download
 python -m runners.run_time_series --dataset etth1 --model dlinear --seq-len 96 --pred-len 24 --epochs 20 --batch-size 64 --seed 0 --device cuda
-python -m runners.run_segmentation --train-dataset voc --val-dataset voc --model unet --epochs 20 --batch-size 8 --seed 0 --height 512 --width 512 --device cuda --download-voc
 ```
 
 ### Single-model method comparison
@@ -66,7 +60,7 @@ python -m runners.run_segmentation --train-dataset voc --val-dataset voc --model
 
 ```bash
 python -m runners.run_classification \
-  --dataset cifar100 --model resnet18 --method naive \
+  --dataset cifar100 --model resnet18 --method independent \
   --epochs 20 --batch-size 64 --seed 0 --device cuda --download
 
 python -m runners.run_classification \
@@ -75,7 +69,7 @@ python -m runners.run_classification \
   --classification-imitation-loss kl
 
 python -m runners.run_classification \
-  --dataset cifar100 --model resnet18 --method studygroup \
+  --dataset cifar100 --model resnet18 --method ssml \
   --epochs 20 --batch-size 64 --seed 0 --device cuda --download \
   --lambda-imitation 1.0 --margin 0.0 --warmup-epochs 5
 ```
@@ -87,7 +81,7 @@ python -m runners.run_classification \
 
 공정 비교 규칙:
 - `task`, `dataset`, `model`, `seed`, `epochs`, `batch-size`를 동일하게 유지
-- method(`independent`/`naive`/`dml`/`studygroup`)만 변경
+- method(`independent`/`dml`/`ssml`)만 변경
 - simple 검증은 `--max-train-batches`, `--max-val-batches`로 배치 수 제한 가능
 
 ### Shell scripts (`simple` / `sweep`)
@@ -100,7 +94,6 @@ python -m runners.run_classification \
 - `scripts/simple/run_simple_classification.sh`
 - `scripts/simple/run_simple_operator.sh`
 - `scripts/simple/run_simple_time_series.sh`
-- `scripts/simple/run_simple_segmentation.sh`
 - 기본 결과 경로: `results/run_simple/<task>/<dataset>/<model>/...`
 - 실행 종료 시 `src.utils.visualization` 자동 호출
 - 시각화 결과(`runs.csv`, `aggregate.csv`, `best_methods.csv`)는 기본적으로 `results/run_simple/`에 함께 저장
@@ -109,7 +102,6 @@ python -m runners.run_classification \
 - `scripts/sweep/tune_classification.sh`
 - `scripts/sweep/tune_operator.sh`
 - `scripts/sweep/tune_time_series.sh`
-- `scripts/sweep/tune_segmentation.sh`
 - 기본 결과 경로: `results/sweep/<task>/hyper_parameter/...`
 - 실행 종료 시 `src.utils.visualization` 자동 호출
 - 시각화 결과(`runs.csv`, `aggregate.csv`, `best_methods.csv`)는 기본적으로 `results/sweep/<task>/hyper_parameter/`에 함께 저장
@@ -127,20 +119,18 @@ bash scripts/sweep/tune_classification.sh
 
 ```bash
 python -m runners.sweep \
-  --tasks classification operator time_series segmentation \
+  --tasks classification operator time_series \
   --seeds 0 1 2 \
   --epochs 20 \
   --device cuda \
   --include-neuralop-models \
   --download-classification \
   --download-operator \
-  --download-voc \
   --continue-on-error
 ```
 
 ```bash
 python -m runners.sweep --dry-run --max-runs 4
-python -m runners.sweep --tasks segmentation --include-cityscapes
 ```
 
 ## Outputs
@@ -159,26 +149,23 @@ scripts/sweep 시각화/집계 파일 저장: `results/sweep/<task>/hyper_parame
 현재는 아래 범위를 제공합니다.
 - single-model supervised baseline (`runners.run_*`)
 
-`Instruction.md`의 full mutual/SSMO 확장(`SSMO-soft` 등 추가 ablation)은 다음 구현 단계입니다.
+현재 method 축은 `independent`, `dml`, `ssml` 3개만 사용합니다.
 
 ## Practical Notes
 
 - `--epochs 20`은 기본 simple 검증값입니다.
 - 본 실험은 태스크별로 epoch를 더 길게 주는 것을 권장합니다.
-  - 예시: classification 100, operator 150, time-series 60, segmentation 80
+  - 예시: classification 100, operator 150, time-series 60
 
 ```bash
 python -m runners.sweep \
-  --tasks classification operator time_series segmentation \
+  --tasks classification operator time_series \
   --seeds 0 1 2 3 4 \
   --classification-epochs 100 \
   --operator-epochs 150 \
   --time-series-epochs 60 \
-  --segmentation-epochs 80 \
   --device cuda \
   --include-neuralop-models \
-  --include-cityscapes \
   --download-operator \
-  --download-voc \
   --continue-on-error
 ```

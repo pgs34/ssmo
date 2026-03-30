@@ -11,7 +11,7 @@ run_gpu0() {
 run_gpu1() {
   echo "[DIST] GPU1 is reserved for smoke runs or failed-run retries."
   echo "[DIST] Example:"
-  echo "CUDA_VISIBLE_DEVICES=1 METHODS='studygroup' DATASETS='etth1' MODEL_PAIRS='dlinear:dlinear' EPOCHS='2' OUTPUT_DIR='results/time_series_method_diff_retry' bash scripts/simple/run_simple_time_series.sh"
+  echo "CUDA_VISIBLE_DEVICES=1 METHODS='ssml' DATASETS='etth1' MODEL_PAIRS='dlinear:dlinear' EPOCHS='2' OUTPUT_DIR='results/time_series_method_diff_retry' bash scripts/simple/run_simple_time_series.sh"
 }
 
 run_gpu0 &

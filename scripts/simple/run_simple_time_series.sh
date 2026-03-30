@@ -3,7 +3,7 @@ set -euo pipefail
 
 cd "$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
-METHODS="${METHODS:-independent naive dml studygroup}"
+METHODS="${METHODS:-independent dml ssml}"
 DATASETS="${DATASETS:-etth1 electricity weather}"
 SEEDS="${SEEDS:-0}"
 if [[ -n "${MODELS:-}" && -z "${MODEL_PAIRS:-}" ]]; then
@@ -27,7 +27,7 @@ TARGET_COLUMN="${TARGET_COLUMN:-}"
 REGRESSION_IMITATION_LOSSES="${REGRESSION_IMITATION_LOSSES:-mse}"
 LAMBDA_IMITATION="${LAMBDA_IMITATION:-1.0}"
 MARGIN="${MARGIN:-0.0}"
-WARMUP_STUDYGROUP="${WARMUP_STUDYGROUP:-3}"
+WARMUP_EPOCHS="${WARMUP_EPOCHS:-3}"
 
 for PAIR in $MODEL_PAIRS; do
   IFS=':' read -r MODEL PEER_MODEL <<< "$PAIR"
@@ -56,7 +56,7 @@ for PAIR in $MODEL_PAIRS; do
               --regression-imitation-loss "$LOSS"
               --lambda-imitation "$LAMBDA_IMITATION"
               --margin "$MARGIN"
-              --warmup-epochs "$WARMUP_STUDYGROUP"
+              --warmup-epochs "$WARMUP_EPOCHS"
               --feature-mode "$FEATURE_MODE"
             )
 

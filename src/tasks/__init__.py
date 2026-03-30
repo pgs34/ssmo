@@ -9,8 +9,6 @@ __all__ = [
     "build_classification_dataloaders",
     "OperatorDataConfig",
     "build_operator_dataloaders",
-    "SegmentationDataConfig",
-    "build_segmentation_dataloaders",
     "TimeSeriesDataConfig",
     "build_time_series_dataloaders",
 ]
@@ -22,9 +20,6 @@ def __getattr__(name: str):
         return getattr(module, name)
     if name in {"OperatorDataConfig", "build_operator_dataloaders"}:
         module = import_module(".operator", __name__)
-        return getattr(module, name)
-    if name in {"SegmentationDataConfig", "build_segmentation_dataloaders"}:
-        module = import_module(".segmentation", __name__)
         return getattr(module, name)
     if name in {"TimeSeriesDataConfig", "build_time_series_dataloaders"}:
         module = import_module(".time_series", __name__)

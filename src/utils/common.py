@@ -69,7 +69,8 @@ def save_live_loss_plot(
 
     task = str(task).strip()
     method_pattern = re.compile(
-        r"^(?P<model>.+)_(?P<method>independent|naive|dml|studygroup)(?:_(?P<loss>[^/]+))?_seed(?P<seed>\d+)$"
+        r"^(?P<model>.+)_(?P<method>independent|dml|ssml)"
+        r"(?:_(?P<loss>[^/]+))?_seed(?P<seed>\d+)$"
     )
     method_curve_paths: dict[str, Path] = {}
     model_title = ""
@@ -126,7 +127,11 @@ def save_live_loss_plot(
     else:
         methods = [m for m in methods if m in candidate_methods]
 
-    method_order = {"independent": 0, "naive": 1, "dml": 2, "studygroup": 3}
+    method_order = {
+        "independent": 0,
+        "dml": 2,
+        "ssml": 3,
+    }
     methods.sort(key=lambda m: (method_order.get(m, 99), m))
 
     if not methods:
@@ -135,13 +140,11 @@ def save_live_loss_plot(
 
     task_train_keys = {
         "classification": ["train_loss", "train_total", "train_loss1", "train_total1"],
-        "segmentation": ["train_loss", "train_total", "train_loss1", "train_total1"],
         "operator": ["train_mse", "train_total", "train_loss", "train_mse1"],
         "time_series": ["train_mse", "train_total", "train_loss", "train_mse1"],
     }
     task_val_keys = {
         "classification": ["val_loss", "val_mse", "val_mae"],
-        "segmentation": ["val_loss", "val_mse", "val_mae"],
         "operator": ["val_mse", "val_loss", "val_mae"],
         "time_series": ["val_mse", "val_loss", "val_mae"],
     }

@@ -22,8 +22,12 @@ try:
 except Exception:
     HAS_MATPLOTLIB = False
 
-METHOD_ORDER = {"independent": 0, "naive": 1, "dml": 2, "studygroup": 3}
-MAXIMIZE_METRICS = {"acc", "miou", "pixel_acc"}
+METHOD_ORDER = {
+    "independent": 0,
+    "dml": 2,
+    "ssml": 3,
+}
+MAXIMIZE_METRICS = {"acc"}
 
 
 def parse_args() -> argparse.Namespace:
@@ -57,6 +61,24 @@ def _slug(s: str) -> str:
     return "".join(allowed).strip("_")
 
 
+def _normalize_method(data: dict[str, Any]) -> str:
+    raw_method = str(data.get("method", "")).strip().lower()
+    if raw_method in METHOD_ORDER:
+        return raw_method
+
+    peer_model = str(data.get("peer_model") or "").strip()
+    mean_weight = _to_float(data.get("mean_imitation_weight"))
+    active_ratio = _to_float(data.get("active_imitation_ratio"))
+
+    if not peer_model:
+        return "independent"
+    if not math.isnan(mean_weight) and not math.isnan(active_ratio):
+        if mean_weight >= 0.999 and active_ratio >= 0.999:
+            return "dml"
+        return "ssml"
+    return ""
+
+
 def _infer_metric_key(task: str, data: dict[str, Any]) -> str:
     if data.get("best_metric_key"):
         return str(data["best_metric_key"])
@@ -64,8 +86,6 @@ def _infer_metric_key(task: str, data: dict[str, Any]) -> str:
         return "acc"
     if task in {"operator", "time_series"}:
         return "mse"
-    if task == "segmentation":
-        return "miou"
     return "metric"
 
 
@@ -78,8 +98,6 @@ def _infer_best_metric(task: str, data: dict[str, Any], suffix: str = "") -> flo
         return _to_float(data.get("best_val_acc"))
     if task in {"operator", "time_series"}:
         return _to_float(data.get("best_val_mse"))
-    if task == "segmentation":
-        return _to_float(data.get("best_val_miou"))
     return float("nan")
 
 
@@ -153,16 +171,11 @@ def discover_rows(input_dir: Path) -> list[dict[str, Any]]:
             continue
 
         task = str(data.get("task", "")).strip()
-        method = str(data.get("method", "")).strip()
+        method = _normalize_method(data)
         if not task or not method:
             continue
 
         dataset = str(data.get("dataset", "")).strip()
-        if not dataset:
-            train_ds = str(data.get("train_dataset", "")).strip()
-            val_ds = str(data.get("val_dataset", "")).strip()
-            if task == "segmentation" and train_ds and val_ds:
-                dataset = f"{train_ds}_to_{val_ds}"
         if not dataset:
             continue
 
@@ -172,6 +185,64 @@ def discover_rows(input_dir: Path) -> list[dict[str, Any]]:
         warmup_epochs = _to_int(data.get("warmup_epochs", -1))
         lambda_imitation = _to_float(data.get("lambda_imitation"))
         margin = _to_float(data.get("margin"))
+
+        model1 = str(data.get("model1", "")).strip()
+        model2 = str(data.get("model2", "")).strip()
+        has_pair_metrics = bool(model1 and model2 and ("best_metric2" in data or "final_metric2" in data))
+        if has_pair_metrics:
+            pair_mean_weight = _to_float(data.get("mean_imitation_weight"))
+            pair_active_ratio = _to_float(data.get("active_imitation_ratio"))
+            pair_sup_loss = _to_float(data.get("supervised_loss_mean"))
+            pair_imit_loss = _to_float(data.get("imitation_loss_mean"))
+            rows.append(
+                _make_row(
+                    summary_path=summary_path,
+                    task=task,
+                    dataset=dataset,
+                    method=method,
+                    model=model1,
+                    peer_model=model2,
+                    seed=seed,
+                    metric_key=metric_key,
+                    best_metric=_infer_best_metric(task, data, suffix="1"),
+                    final_val=_infer_final_val(task, data, suffix="1"),
+                    epochs=epochs,
+                    warmup_epochs=warmup_epochs,
+                    lambda_imitation=lambda_imitation,
+                    margin=margin,
+                    mean_imitation_weight=pair_mean_weight,
+                    active_imitation_ratio=pair_active_ratio,
+                    supervised_loss_mean=pair_sup_loss,
+                    imitation_loss_mean=pair_imit_loss,
+                    curve_mode="pair",
+                    model_idx=1,
+                )
+            )
+            rows.append(
+                _make_row(
+                    summary_path=summary_path,
+                    task=task,
+                    dataset=dataset,
+                    method=method,
+                    model=model2,
+                    peer_model=model1,
+                    seed=seed,
+                    metric_key=metric_key,
+                    best_metric=_infer_best_metric(task, data, suffix="2"),
+                    final_val=_infer_final_val(task, data, suffix="2"),
+                    epochs=epochs,
+                    warmup_epochs=warmup_epochs,
+                    lambda_imitation=lambda_imitation,
+                    margin=margin,
+                    mean_imitation_weight=pair_mean_weight,
+                    active_imitation_ratio=pair_active_ratio,
+                    supervised_loss_mean=pair_sup_loss,
+                    imitation_loss_mean=pair_imit_loss,
+                    curve_mode="pair",
+                    model_idx=2,
+                )
+            )
+            continue
 
         # Preferred model-centric schema.
         if data.get("model"):
@@ -201,9 +272,6 @@ def discover_rows(input_dir: Path) -> list[dict[str, Any]]:
             )
             continue
 
-        # Backward compatibility for old pair schema.
-        model1 = str(data.get("model1", "")).strip()
-        model2 = str(data.get("model2", "")).strip()
         if not model1 or not model2:
             continue
 
@@ -261,7 +329,7 @@ def discover_rows(input_dir: Path) -> list[dict[str, Any]]:
 def write_csv(path: Path, rows: list[dict[str, Any]], fieldnames: list[str]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(rows)
 
@@ -586,8 +654,6 @@ def visualize_pair_results(input_dir: str | Path, output_dir: str | Path) -> dic
         "imitation_loss_mean",
         "curve_mode",
         "model_idx",
-        "run_dir",
-        "summary_path",
     ]
     write_csv(output_path / "runs.csv", rows, run_fields)
 

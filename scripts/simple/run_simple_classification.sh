@@ -3,7 +3,7 @@ set -euo pipefail
 
 cd "$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
-METHODS="${METHODS:-naive dml studygroup}"
+METHODS="${METHODS:-independent dml ssml}"
 DATASETS="${DATASETS:-cifar10 cifar100}"
 SEEDS="${SEEDS:-0}"
 if [[ -n "${MODELS:-}" && -z "${MODEL_PAIRS:-}" ]]; then
@@ -21,7 +21,7 @@ OUTPUT_DIR="${OUTPUT_DIR:-results/run_simple}"
 CLASSIFICATION_IMITATION_LOSSES="${CLASSIFICATION_IMITATION_LOSSES:-kl}"
 LAMBDA_IMITATION="${LAMBDA_IMITATION:-1.0}"
 MARGIN="${MARGIN:-0.0}"
-WARMUP_STUDYGROUP="${WARMUP_STUDYGROUP:-5}"
+WARMUP_EPOCHS="${WARMUP_EPOCHS:-5}"
 LABEL_NOISE_CONDITIONS="${LABEL_NOISE_CONDITIONS:-none:0.0 symmetric:0.2 symmetric:0.4 symmetric:0.6 asymmetric:0.2 asymmetric:0.4 asymmetric:0.6}"
 DOWNLOAD_CLASSIFICATION="${DOWNLOAD_CLASSIFICATION:-1}"
 TRAIN_SUBSET_SIZE="${TRAIN_SUBSET_SIZE:-}"
@@ -57,10 +57,10 @@ for PAIR in $MODEL_PAIRS; do
               --classification-imitation-loss "$LOSS"
               --lambda-imitation "$LAMBDA_IMITATION"
               --margin "$MARGIN"
-              --warmup-epochs "$WARMUP_STUDYGROUP"
+              --warmup-epochs "$WARMUP_EPOCHS"
             )
 
-            if [[ "$METHOD" != "naive" ]]; then
+            if [[ "$METHOD" != "independent" ]]; then
               CMD+=(--peer-model "$PEER_MODEL")
             fi
             if [[ "$NOISE_TYPE" != "none" && "$NOISE_RATE" != "0" && "$NOISE_RATE" != "0.0" ]]; then

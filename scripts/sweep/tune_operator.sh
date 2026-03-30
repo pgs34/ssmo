@@ -13,7 +13,7 @@ SWEEP_OUTPUT_DIR="results/sweep/operator/hyper_parameter"
 echo "[CONFIG] task=operator_sweep"
 echo "[CONFIG] reg_losses=${REG_LOSSES[*]}"
 echo "[CONFIG] lambdas=${LAMBDAS[*]} margins=${MARGINS[*]} warmups=${WARMUPS[*]}"
-echo "[CONFIG] methods=dml studygroup datasets=darcy navier_stokes burgers"
+echo "[CONFIG] methods=dml ssml datasets=darcy navier_stokes burgers"
 echo "[CONFIG] model_pairs=fno:fno deeponet:deeponet fno:deeponet"
 echo "[CONFIG] seeds=0 1 2 3 4 epochs=180 batch_size=16 device=cuda"
 echo "[CONFIG] output_dir=$SWEEP_OUTPUT_DIR"
@@ -26,8 +26,8 @@ for reg_loss in "${REG_LOSSES[@]}"; do
         REGRESSION_IMITATION_LOSS="$reg_loss" \
         LAMBDA_IMITATION="$lambda_imitation" \
         MARGIN="$margin" \
-        WARMUP_STUDYGROUP="$warmup" \
-        METHODS="dml studygroup" \
+        WARMUP_EPOCHS="$warmup" \
+        METHODS="dml ssml" \
         DATASETS="darcy navier_stokes burgers" \
         MODEL_PAIRS="fno:fno deeponet:deeponet fno:deeponet" \
         SEEDS="0 1 2 3 4" \

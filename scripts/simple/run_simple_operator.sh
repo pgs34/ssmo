@@ -3,7 +3,7 @@ set -euo pipefail
 
 cd "$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
-METHODS="${METHODS:-naive dml studygroup}"
+METHODS="${METHODS:-independent dml ssml}"
 DATASETS="${DATASETS:-burgers darcy navier_stokes}"
 SEEDS="${SEEDS:-0}"
 if [[ -n "${MODELS:-}" && -z "${MODEL_PAIRS:-}" ]]; then
@@ -22,7 +22,7 @@ OUTPUT_DIR="${OUTPUT_DIR:-results/run_simple}"
 REGRESSION_IMITATION_LOSSES="${REGRESSION_IMITATION_LOSSES:-mse}"
 LAMBDA_IMITATION="${LAMBDA_IMITATION:-1.0}"
 MARGIN="${MARGIN:-0.0}"
-WARMUP_STUDYGROUP="${WARMUP_STUDYGROUP:-5}"
+WARMUP_EPOCHS="${WARMUP_EPOCHS:-5}"
 DOWNLOAD_OPERATOR="${DOWNLOAD_OPERATOR:-0}"
 
 for PAIR in $MODEL_PAIRS; do
@@ -49,11 +49,11 @@ for PAIR in $MODEL_PAIRS; do
             --regression-imitation-loss "$LOSS"
             --lambda-imitation "$LAMBDA_IMITATION"
             --margin "$MARGIN"
-            --warmup-epochs "$WARMUP_STUDYGROUP"
+            --warmup-epochs "$WARMUP_EPOCHS"
             --download
           )
 
-          if [[ "$METHOD" != "naive" ]]; then
+          if [[ "$METHOD" != "independent" ]]; then
             CMD+=(--peer-model "$PEER_MODEL")
           fi
           if [[ "$DOWNLOAD_OPERATOR" == "1" ]]; then
