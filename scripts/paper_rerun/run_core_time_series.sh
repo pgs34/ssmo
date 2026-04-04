@@ -16,6 +16,8 @@ BATCH_SIZE="${BATCH_SIZE:-64}"
 NUM_WORKERS="${NUM_WORKERS:-4}"
 DEVICE="${DEVICE:-cuda}"
 OUTPUT_DIR="${OUTPUT_DIR:-$(paper_results_root)/time_series}"
+LR="${LR:-1e-3}"
+WEIGHT_DECAY="${WEIGHT_DECAY:-0.0}"
 SEQ_LEN="${SEQ_LEN:-96}"
 PRED_LENS="${PRED_LENS:-24}"
 REGRESSION_IMITATION_LOSS="${REGRESSION_IMITATION_LOSS:-mse}"
@@ -45,6 +47,27 @@ SSML_GATE_SCORE_MODE="${SSML_GATE_SCORE_MODE:-peer_better_student_error}"
 SSML_SCORE_TRANSFORM="${SSML_SCORE_TRANSFORM:-none}"
 SSML_POSITIVE_UPPER_QUANTILE="${SSML_POSITIVE_UPPER_QUANTILE:-1.0}"
 SSML_GUIDANCE_MODE="${SSML_GUIDANCE_MODE:-hybrid}"
+SSML_CORRECTION_GATE_HIDDEN_DIM="${SSML_CORRECTION_GATE_HIDDEN_DIM:-32}"
+SSML_CORRECTION_GATE_DROPOUT="${SSML_CORRECTION_GATE_DROPOUT:-0.0}"
+SSML_CORRECTION_INIT_BIAS="${SSML_CORRECTION_INIT_BIAS:-0.0}"
+SSML_CORRECTION_SPARSITY_WEIGHT="${SSML_CORRECTION_SPARSITY_WEIGHT:-0.0}"
+SSML_CORRECTION_THRESHOLD="${SSML_CORRECTION_THRESHOLD:-0.5}"
+SSML_CORRECTION_RAMP_START_EPOCH="${SSML_CORRECTION_RAMP_START_EPOCH:-1}"
+SSML_CORRECTION_RAMP_END_EPOCH="${SSML_CORRECTION_RAMP_END_EPOCH:-1}"
+SSML_CORRECTION_FREEZE_STUDENT_EPOCHS="${SSML_CORRECTION_FREEZE_STUDENT_EPOCHS:-0}"
+SSML_CORRECTION_ONLY="${SSML_CORRECTION_ONLY:-0}"
+SSML_CORRECTION_TAIL_START_RATIO="${SSML_CORRECTION_TAIL_START_RATIO:-0.0}"
+SSML_CORRECTION_REGIME_FOCUS_QUANTILE="${SSML_CORRECTION_REGIME_FOCUS_QUANTILE:-0.0}"
+SSML_CORRECTION_FOCUS_LOSS_ALPHA="${SSML_CORRECTION_FOCUS_LOSS_ALPHA:-0.0}"
+SSML_CORRECTION_PEER_ADVANTAGE_QUANTILE="${SSML_CORRECTION_PEER_ADVANTAGE_QUANTILE:-0.0}"
+SSML_CORRECTION_PEER_ADVANTAGE_MIN="${SSML_CORRECTION_PEER_ADVANTAGE_MIN:-0.0}"
+SSML_CORRECTION_PEER_ADVANTAGE_SMOOTHING_KERNEL="${SSML_CORRECTION_PEER_ADVANTAGE_SMOOTHING_KERNEL:-1}"
+SSML_CORRECTION_BUDGET_RATIO="${SSML_CORRECTION_BUDGET_RATIO:-0.0}"
+SSML_CORRECTION_FEATURE_MODE="${SSML_CORRECTION_FEATURE_MODE:-basic}"
+SSML_CORRECTION_USE_REGIME_FEATURES="${SSML_CORRECTION_USE_REGIME_FEATURES:-0}"
+SSML_CORRECTION_DECOMPOSITION_KERNEL="${SSML_CORRECTION_DECOMPOSITION_KERNEL:-9}"
+SSML_CORRECTION_TREND_SCALE="${SSML_CORRECTION_TREND_SCALE:-1.0}"
+SSML_CORRECTION_RESIDUAL_SCALE="${SSML_CORRECTION_RESIDUAL_SCALE:-1.0}"
 FEATURE_MODE="${FEATURE_MODE:-multivariate}"
 SSML_SCORE_SMOOTHING_KERNEL="${SSML_SCORE_SMOOTHING_KERNEL:-1}"
 SSML_WINDOW_SCORE_KERNEL="${SSML_WINDOW_SCORE_KERNEL:-1}"
@@ -57,6 +80,9 @@ SSML_RESIDUAL_SPACE_KERNEL="${SSML_RESIDUAL_SPACE_KERNEL:-9}"
 SSML_CONFLICT_AWARE_PROJECTION="${SSML_CONFLICT_AWARE_PROJECTION:-0}"
 INIT_CHECKPOINT_TEMPLATE="${INIT_CHECKPOINT_TEMPLATE:-}"
 PEER_INIT_CHECKPOINT_TEMPLATE="${PEER_INIT_CHECKPOINT_TEMPLATE:-}"
+EARLY_STOP_PATIENCE="${EARLY_STOP_PATIENCE:-0}"
+EARLY_STOP_MIN_EPOCHS="${EARLY_STOP_MIN_EPOCHS:-0}"
+EARLY_STOP_MIN_DELTA="${EARLY_STOP_MIN_DELTA:-0.0}"
 LIVE_PLOT_INTERVAL="${LIVE_PLOT_INTERVAL:-20}"
 
 render_checkpoint_template() {
@@ -82,6 +108,7 @@ render_checkpoint_template() {
 echo "[time_series] output_dir=$OUTPUT_DIR"
 echo "[time_series] methods=$METHODS"
 echo "[time_series] model_pairs=$MODEL_PAIRS"
+echo "[time_series] lr=$LR weight_decay=$WEIGHT_DECAY"
 echo "[time_series] ssml_topk_ratio=$SSML_TOPK_RATIO"
 echo "[time_series] ssml_topk_scope=$SSML_TOPK_SCOPE"
 echo "[time_series] ssml_max_selected_ratio=$SSML_MAX_SELECTED_RATIO"
@@ -97,6 +124,27 @@ echo "[time_series] ssml_gate_score_mode=$SSML_GATE_SCORE_MODE"
 echo "[time_series] ssml_score_transform=$SSML_SCORE_TRANSFORM"
 echo "[time_series] ssml_positive_upper_quantile=$SSML_POSITIVE_UPPER_QUANTILE"
 echo "[time_series] ssml_guidance_mode=$SSML_GUIDANCE_MODE"
+echo "[time_series] ssml_correction_gate_hidden_dim=$SSML_CORRECTION_GATE_HIDDEN_DIM"
+echo "[time_series] ssml_correction_gate_dropout=$SSML_CORRECTION_GATE_DROPOUT"
+echo "[time_series] ssml_correction_init_bias=$SSML_CORRECTION_INIT_BIAS"
+echo "[time_series] ssml_correction_sparsity_weight=$SSML_CORRECTION_SPARSITY_WEIGHT"
+echo "[time_series] ssml_correction_threshold=$SSML_CORRECTION_THRESHOLD"
+echo "[time_series] ssml_correction_ramp_start_epoch=$SSML_CORRECTION_RAMP_START_EPOCH"
+echo "[time_series] ssml_correction_ramp_end_epoch=$SSML_CORRECTION_RAMP_END_EPOCH"
+echo "[time_series] ssml_correction_freeze_student_epochs=$SSML_CORRECTION_FREEZE_STUDENT_EPOCHS"
+echo "[time_series] ssml_correction_only=$SSML_CORRECTION_ONLY"
+echo "[time_series] ssml_correction_tail_start_ratio=$SSML_CORRECTION_TAIL_START_RATIO"
+echo "[time_series] ssml_correction_regime_focus_quantile=$SSML_CORRECTION_REGIME_FOCUS_QUANTILE"
+echo "[time_series] ssml_correction_focus_loss_alpha=$SSML_CORRECTION_FOCUS_LOSS_ALPHA"
+echo "[time_series] ssml_correction_peer_advantage_quantile=$SSML_CORRECTION_PEER_ADVANTAGE_QUANTILE"
+echo "[time_series] ssml_correction_peer_advantage_min=$SSML_CORRECTION_PEER_ADVANTAGE_MIN"
+echo "[time_series] ssml_correction_peer_advantage_smoothing_kernel=$SSML_CORRECTION_PEER_ADVANTAGE_SMOOTHING_KERNEL"
+echo "[time_series] ssml_correction_budget_ratio=$SSML_CORRECTION_BUDGET_RATIO"
+echo "[time_series] ssml_correction_feature_mode=$SSML_CORRECTION_FEATURE_MODE"
+echo "[time_series] ssml_correction_use_regime_features=$SSML_CORRECTION_USE_REGIME_FEATURES"
+echo "[time_series] ssml_correction_decomposition_kernel=$SSML_CORRECTION_DECOMPOSITION_KERNEL"
+echo "[time_series] ssml_correction_trend_scale=$SSML_CORRECTION_TREND_SCALE"
+echo "[time_series] ssml_correction_residual_scale=$SSML_CORRECTION_RESIDUAL_SCALE"
 echo "[time_series] ssml_score_smoothing_kernel=$SSML_SCORE_SMOOTHING_KERNEL"
 echo "[time_series] ssml_window_score_kernel=$SSML_WINDOW_SCORE_KERNEL"
 echo "[time_series] ssml_window_expand_kernel=$SSML_WINDOW_EXPAND_KERNEL"
@@ -111,6 +159,7 @@ echo "[time_series] ssml_worse_only_update=$SSML_WORSE_ONLY_UPDATE"
 echo "[time_series] ssml_anchor_weight=$SSML_ANCHOR_WEIGHT"
 echo "[time_series] init_checkpoint_template=$INIT_CHECKPOINT_TEMPLATE"
 echo "[time_series] peer_init_checkpoint_template=$PEER_INIT_CHECKPOINT_TEMPLATE"
+echo "[time_series] early_stop_patience=$EARLY_STOP_PATIENCE early_stop_min_epochs=$EARLY_STOP_MIN_EPOCHS early_stop_min_delta=$EARLY_STOP_MIN_DELTA"
 echo "[time_series] live_plot_interval=$LIVE_PLOT_INTERVAL"
 
 for dataset in $DATASETS; do
@@ -128,6 +177,8 @@ for dataset in $DATASETS; do
               --epochs "$EPOCHS"
               --batch-size "$BATCH_SIZE"
               --num-workers "$NUM_WORKERS"
+              --lr "$LR"
+              --weight-decay "$WEIGHT_DECAY"
               --seed "$seed"
               --device "$DEVICE"
               --output-dir "$OUTPUT_DIR"
@@ -155,6 +206,25 @@ for dataset in $DATASETS; do
               --ssml-score-transform "$SSML_SCORE_TRANSFORM"
               --ssml-positive-upper-quantile "$SSML_POSITIVE_UPPER_QUANTILE"
               --ssml-guidance-mode "$SSML_GUIDANCE_MODE"
+              --ssml-correction-gate-hidden-dim "$SSML_CORRECTION_GATE_HIDDEN_DIM"
+              --ssml-correction-gate-dropout "$SSML_CORRECTION_GATE_DROPOUT"
+              --ssml-correction-init-bias "$SSML_CORRECTION_INIT_BIAS"
+              --ssml-correction-sparsity-weight "$SSML_CORRECTION_SPARSITY_WEIGHT"
+              --ssml-correction-threshold "$SSML_CORRECTION_THRESHOLD"
+              --ssml-correction-ramp-start-epoch "$SSML_CORRECTION_RAMP_START_EPOCH"
+              --ssml-correction-ramp-end-epoch "$SSML_CORRECTION_RAMP_END_EPOCH"
+              --ssml-correction-freeze-student-epochs "$SSML_CORRECTION_FREEZE_STUDENT_EPOCHS"
+              --ssml-correction-tail-start-ratio "$SSML_CORRECTION_TAIL_START_RATIO"
+              --ssml-correction-regime-focus-quantile "$SSML_CORRECTION_REGIME_FOCUS_QUANTILE"
+              --ssml-correction-focus-loss-alpha "$SSML_CORRECTION_FOCUS_LOSS_ALPHA"
+              --ssml-correction-peer-advantage-quantile "$SSML_CORRECTION_PEER_ADVANTAGE_QUANTILE"
+              --ssml-correction-peer-advantage-min "$SSML_CORRECTION_PEER_ADVANTAGE_MIN"
+              --ssml-correction-peer-advantage-smoothing-kernel "$SSML_CORRECTION_PEER_ADVANTAGE_SMOOTHING_KERNEL"
+              --ssml-correction-budget-ratio "$SSML_CORRECTION_BUDGET_RATIO"
+              --ssml-correction-feature-mode "$SSML_CORRECTION_FEATURE_MODE"
+              --ssml-correction-decomposition-kernel "$SSML_CORRECTION_DECOMPOSITION_KERNEL"
+              --ssml-correction-trend-scale "$SSML_CORRECTION_TREND_SCALE"
+              --ssml-correction-residual-scale "$SSML_CORRECTION_RESIDUAL_SCALE"
               --ssml-score-smoothing-kernel "$SSML_SCORE_SMOOTHING_KERNEL"
               --ssml-window-score-kernel "$SSML_WINDOW_SCORE_KERNEL"
               --ssml-window-expand-kernel "$SSML_WINDOW_EXPAND_KERNEL"
@@ -164,6 +234,9 @@ for dataset in $DATASETS; do
               --ssml-imitation-space "$SSML_IMITATION_SPACE"
               --ssml-residual-space-kernel "$SSML_RESIDUAL_SPACE_KERNEL"
               --feature-mode "$FEATURE_MODE"
+              --early-stop-patience "$EARLY_STOP_PATIENCE"
+              --early-stop-min-epochs "$EARLY_STOP_MIN_EPOCHS"
+              --early-stop-min-delta "$EARLY_STOP_MIN_DELTA"
               --live-plot-interval "$LIVE_PLOT_INTERVAL"
             )
 
@@ -181,6 +254,12 @@ for dataset in $DATASETS; do
             fi
             if [[ "$SSML_CONFLICT_AWARE_PROJECTION" == "1" ]]; then
               cmd+=(--ssml-conflict-aware-projection)
+            fi
+            if [[ "$SSML_CORRECTION_USE_REGIME_FEATURES" == "1" ]]; then
+              cmd+=(--ssml-correction-use-regime-features)
+            fi
+            if [[ "$SSML_CORRECTION_ONLY" == "1" ]]; then
+              cmd+=(--ssml-correction-only)
             fi
             cmd+=(--ssml-anchor-weight "$SSML_ANCHOR_WEIGHT")
             if [[ -n "$init_checkpoint" ]]; then
@@ -213,6 +292,8 @@ for dataset in $DATASETS; do
             --epochs "$EPOCHS"
             --batch-size "$BATCH_SIZE"
             --num-workers "$NUM_WORKERS"
+            --lr "$LR"
+            --weight-decay "$WEIGHT_DECAY"
             --seed "$seed"
             --device "$DEVICE"
             --output-dir "$OUTPUT_DIR"
@@ -240,6 +321,25 @@ for dataset in $DATASETS; do
             --ssml-score-transform "$SSML_SCORE_TRANSFORM"
             --ssml-positive-upper-quantile "$SSML_POSITIVE_UPPER_QUANTILE"
             --ssml-guidance-mode "$SSML_GUIDANCE_MODE"
+            --ssml-correction-gate-hidden-dim "$SSML_CORRECTION_GATE_HIDDEN_DIM"
+            --ssml-correction-gate-dropout "$SSML_CORRECTION_GATE_DROPOUT"
+            --ssml-correction-init-bias "$SSML_CORRECTION_INIT_BIAS"
+            --ssml-correction-sparsity-weight "$SSML_CORRECTION_SPARSITY_WEIGHT"
+            --ssml-correction-threshold "$SSML_CORRECTION_THRESHOLD"
+            --ssml-correction-ramp-start-epoch "$SSML_CORRECTION_RAMP_START_EPOCH"
+            --ssml-correction-ramp-end-epoch "$SSML_CORRECTION_RAMP_END_EPOCH"
+            --ssml-correction-freeze-student-epochs "$SSML_CORRECTION_FREEZE_STUDENT_EPOCHS"
+            --ssml-correction-tail-start-ratio "$SSML_CORRECTION_TAIL_START_RATIO"
+            --ssml-correction-regime-focus-quantile "$SSML_CORRECTION_REGIME_FOCUS_QUANTILE"
+            --ssml-correction-focus-loss-alpha "$SSML_CORRECTION_FOCUS_LOSS_ALPHA"
+            --ssml-correction-peer-advantage-quantile "$SSML_CORRECTION_PEER_ADVANTAGE_QUANTILE"
+            --ssml-correction-peer-advantage-min "$SSML_CORRECTION_PEER_ADVANTAGE_MIN"
+            --ssml-correction-peer-advantage-smoothing-kernel "$SSML_CORRECTION_PEER_ADVANTAGE_SMOOTHING_KERNEL"
+            --ssml-correction-budget-ratio "$SSML_CORRECTION_BUDGET_RATIO"
+            --ssml-correction-feature-mode "$SSML_CORRECTION_FEATURE_MODE"
+            --ssml-correction-decomposition-kernel "$SSML_CORRECTION_DECOMPOSITION_KERNEL"
+            --ssml-correction-trend-scale "$SSML_CORRECTION_TREND_SCALE"
+            --ssml-correction-residual-scale "$SSML_CORRECTION_RESIDUAL_SCALE"
             --ssml-score-smoothing-kernel "$SSML_SCORE_SMOOTHING_KERNEL"
             --ssml-window-score-kernel "$SSML_WINDOW_SCORE_KERNEL"
             --ssml-window-expand-kernel "$SSML_WINDOW_EXPAND_KERNEL"
@@ -249,6 +349,9 @@ for dataset in $DATASETS; do
             --ssml-imitation-space "$SSML_IMITATION_SPACE"
             --ssml-residual-space-kernel "$SSML_RESIDUAL_SPACE_KERNEL"
             --feature-mode "$FEATURE_MODE"
+            --early-stop-patience "$EARLY_STOP_PATIENCE"
+            --early-stop-min-epochs "$EARLY_STOP_MIN_EPOCHS"
+            --early-stop-min-delta "$EARLY_STOP_MIN_DELTA"
             --live-plot-interval "$LIVE_PLOT_INTERVAL"
           )
 
@@ -266,6 +369,12 @@ for dataset in $DATASETS; do
           fi
           if [[ "$SSML_CONFLICT_AWARE_PROJECTION" == "1" ]]; then
             cmd+=(--ssml-conflict-aware-projection)
+          fi
+          if [[ "$SSML_CORRECTION_USE_REGIME_FEATURES" == "1" ]]; then
+            cmd+=(--ssml-correction-use-regime-features)
+          fi
+          if [[ "$SSML_CORRECTION_ONLY" == "1" ]]; then
+            cmd+=(--ssml-correction-only)
           fi
           cmd+=(--ssml-anchor-weight "$SSML_ANCHOR_WEIGHT")
           if [[ -n "$init_checkpoint" ]]; then

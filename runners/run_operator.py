@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from pathlib import Path
 from typing import Callable, Optional
 
 import torch
@@ -66,6 +67,11 @@ def parse_args():
     p.add_argument("--imitation-decay-end-epoch", type=int, default=-1)
     p.add_argument("--imitation-decay-min-scale", type=float, default=1.0)
     p.add_argument("--hetero-ssml-one-way", action="store_true")
+    p.add_argument("--ssml-student-only", action="store_true")
+    p.add_argument("--ssml-freeze-peer", action="store_true")
+    p.add_argument("--operator-weight-granularity", type=str, default="sample", choices=["sample", "element"])
+    p.add_argument("--init-checkpoint", type=str, default=None)
+    p.add_argument("--peer-init-checkpoint", type=str, default=None)
     p.add_argument("--live-plot-interval", type=int, default=20)
     return p.parse_args()
 
@@ -85,30 +91,31 @@ def unpack_batch(batch):
 def build_regression_imitation_loss_fn(
     imitation_loss_name: str,
 ) -> Callable[[torch.Tensor, torch.Tensor], torch.Tensor]:
-    def _reduce_per_sample(loss_tensor: torch.Tensor) -> torch.Tensor:
-        if loss_tensor.ndim <= 1:
-            return loss_tensor.reshape(-1)
-        return loss_tensor.reshape(loss_tensor.shape[0], -1).mean(dim=1)
-
     if imitation_loss_name == "mse":
         def _loss(pred: torch.Tensor, peer_pred: torch.Tensor) -> torch.Tensor:
-            return _reduce_per_sample(F.mse_loss(pred, peer_pred.detach(), reduction="none"))
+            return reduce_loss_per_sample(F.mse_loss(pred, peer_pred.detach(), reduction="none"))
 
         return _loss
 
     if imitation_loss_name == "mae":
         def _loss(pred: torch.Tensor, peer_pred: torch.Tensor) -> torch.Tensor:
-            return _reduce_per_sample(F.l1_loss(pred, peer_pred.detach(), reduction="none"))
+            return reduce_loss_per_sample(F.l1_loss(pred, peer_pred.detach(), reduction="none"))
 
         return _loss
 
     if imitation_loss_name == "huber":
         def _loss(pred: torch.Tensor, peer_pred: torch.Tensor) -> torch.Tensor:
-            return _reduce_per_sample(F.smooth_l1_loss(pred, peer_pred.detach(), reduction="none"))
+            return reduce_loss_per_sample(F.smooth_l1_loss(pred, peer_pred.detach(), reduction="none"))
 
         return _loss
 
     raise ValueError(f"Unsupported regression imitation loss: {imitation_loss_name}")
+
+
+def reduce_loss_per_sample(loss_tensor: torch.Tensor) -> torch.Tensor:
+    if loss_tensor.ndim <= 1:
+        return loss_tensor.reshape(-1)
+    return loss_tensor.reshape(loss_tensor.shape[0], -1).mean(dim=1)
 
 
 def build_regression_elementwise_loss_fn(
@@ -174,6 +181,18 @@ def choose_one_way_imitation(
     return False, True
 
 
+def load_model_checkpoint(model: torch.nn.Module, checkpoint_path: Optional[str], label: str) -> Optional[str]:
+    if not checkpoint_path:
+        return None
+    path = Path(checkpoint_path)
+    if not path.exists():
+        raise FileNotFoundError(f"{label} checkpoint does not exist: {path}")
+    state = torch.load(path, map_location="cpu")
+    model.load_state_dict(state)
+    print(f"[operator] loaded {label}_checkpoint={path}")
+    return str(path)
+
+
 def train_one_epoch(
     model,
     peer_model: Optional[torch.nn.Module],
@@ -182,17 +201,23 @@ def train_one_epoch(
     peer_optimizer: Optional[torch.optim.Optimizer],
     device,
     supervised_loss_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
+    supervised_elementwise_loss_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
     imitation_loss_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
     elementwise_imitation_loss_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
     lambda_imitation: float,
     margin: float,
     method: str,
     hetero_ssml_one_way: bool = False,
+    peer_update_disabled: bool = False,
+    operator_weight_granularity: str = "sample",
 ):
     method = canonicalize_method_name(method)
     model.train()
     if peer_model is not None:
-        peer_model.train()
+        if peer_update_disabled:
+            peer_model.eval()
+        else:
+            peer_model.train()
     dml_weight_builder = get_directional_weight_builder("dml")
     ssml_weight_builder = get_directional_weight_builder("ssml")
     total_loss = 0.0
@@ -206,7 +231,8 @@ def train_one_epoch(
         if peer_optimizer is not None:
             peer_optimizer.zero_grad(set_to_none=True)
         pred = model(x)
-        supervised_loss = supervised_loss_fn(pred, y)
+        supervised_loss_map = supervised_elementwise_loss_fn(pred, y)
+        supervised_loss = reduce_loss_per_sample(supervised_loss_map)
 
         if method == "independent":
             loss = supervised_loss.mean()
@@ -214,37 +240,75 @@ def train_one_epoch(
             optimizer.step()
 
         elif method == "dml":
-            if peer_model is None or peer_optimizer is None:
-                raise ValueError("peer_model and peer_optimizer are required when method='dml'")
+            if peer_model is None:
+                raise ValueError("peer_model is required when method='dml'")
+            if not peer_update_disabled and peer_optimizer is None:
+                raise ValueError("peer_optimizer is required when method='dml' unless peer updates are disabled")
 
-            peer_pred = peer_model(x)
-            peer_supervised_loss = supervised_loss_fn(peer_pred, y)
+            if peer_update_disabled:
+                with torch.no_grad():
+                    peer_pred = peer_model(x)
+            else:
+                peer_pred = peer_model(x)
+            peer_supervised_loss_map = supervised_elementwise_loss_fn(peer_pred, y)
+            peer_supervised_loss = reduce_loss_per_sample(peer_supervised_loss_map)
+            student_weight_source = supervised_loss.detach()
+            peer_weight_source = peer_supervised_loss.detach()
+            if operator_weight_granularity == "element":
+                student_weight_source = supervised_loss_map.detach()
+                peer_weight_source = peer_supervised_loss_map.detach()
             w_student, w_peer = dml_weight_builder(
-                supervised_loss.detach(),
-                peer_supervised_loss.detach(),
+                student_weight_source,
+                peer_weight_source,
                 margin=margin,
             )
             if lambda_imitation <= 0.0:
                 w_student = torch.zeros_like(w_student)
                 w_peer = torch.zeros_like(w_peer)
-            imitation_student = weighted_mean(imitation_loss_fn(pred, peer_pred), w_student)
-            imitation_peer = weighted_mean(imitation_loss_fn(peer_pred, pred), w_peer)
+            imitation_student_values = (
+                elementwise_imitation_loss_fn(pred, peer_pred)
+                if operator_weight_granularity == "element"
+                else imitation_loss_fn(pred, peer_pred)
+            )
+            imitation_student = weighted_mean(imitation_student_values, w_student)
 
             loss = supervised_loss.mean() + lambda_imitation * imitation_student
-            peer_loss = peer_supervised_loss.mean() + lambda_imitation * imitation_peer
+            if peer_update_disabled:
+                loss.backward()
+                optimizer.step()
+            else:
+                imitation_peer_values = (
+                    elementwise_imitation_loss_fn(peer_pred, pred)
+                    if operator_weight_granularity == "element"
+                    else imitation_loss_fn(peer_pred, pred)
+                )
+                imitation_peer = weighted_mean(imitation_peer_values, w_peer)
+                peer_loss = peer_supervised_loss.mean() + lambda_imitation * imitation_peer
 
-            (loss + peer_loss).backward()
-            optimizer.step()
-            peer_optimizer.step()
+                (loss + peer_loss).backward()
+                optimizer.step()
+                peer_optimizer.step()
 
         elif method == "ssml":
-            if peer_model is None or peer_optimizer is None:
-                raise ValueError("peer_model and peer_optimizer are required when method='ssml'")
-            peer_pred = peer_model(x)
-            peer_supervised_loss = supervised_loss_fn(peer_pred, y)
+            if peer_model is None:
+                raise ValueError("peer_model is required when method='ssml'")
+            if not peer_update_disabled and peer_optimizer is None:
+                raise ValueError("peer_optimizer is required when method='ssml' unless peer updates are disabled")
+            if peer_update_disabled:
+                with torch.no_grad():
+                    peer_pred = peer_model(x)
+            else:
+                peer_pred = peer_model(x)
+            peer_supervised_loss_map = supervised_elementwise_loss_fn(peer_pred, y)
+            peer_supervised_loss = reduce_loss_per_sample(peer_supervised_loss_map)
+            student_weight_source = supervised_loss.detach()
+            peer_weight_source = peer_supervised_loss.detach()
+            if operator_weight_granularity == "element":
+                student_weight_source = supervised_loss_map.detach()
+                peer_weight_source = peer_supervised_loss_map.detach()
             w_student, w_peer = ssml_weight_builder(
-                supervised_loss.detach(),
-                peer_supervised_loss.detach(),
+                student_weight_source,
+                peer_weight_source,
                 margin=margin,
             )
             if lambda_imitation <= 0.0:
@@ -260,15 +324,29 @@ def train_one_epoch(
                 if not peer_imitates:
                     w_peer = torch.zeros_like(w_peer)
 
-            imitation_term_student = weighted_mean(imitation_loss_fn(pred, peer_pred), w_student)
+            imitation_student_values = (
+                elementwise_imitation_loss_fn(pred, peer_pred)
+                if operator_weight_granularity == "element"
+                else imitation_loss_fn(pred, peer_pred)
+            )
+            imitation_term_student = weighted_mean(imitation_student_values, w_student)
             loss = supervised_loss.mean() + lambda_imitation * imitation_term_student
 
-            imitation_term_peer = weighted_mean(imitation_loss_fn(peer_pred, pred), w_peer)
-            peer_loss = peer_supervised_loss.mean() + lambda_imitation * imitation_term_peer
+            if peer_update_disabled:
+                loss.backward()
+                optimizer.step()
+            else:
+                imitation_peer_values = (
+                    elementwise_imitation_loss_fn(peer_pred, pred)
+                    if operator_weight_granularity == "element"
+                    else imitation_loss_fn(peer_pred, pred)
+                )
+                imitation_term_peer = weighted_mean(imitation_peer_values, w_peer)
+                peer_loss = peer_supervised_loss.mean() + lambda_imitation * imitation_term_peer
 
-            (loss + peer_loss).backward()
-            optimizer.step()
-            peer_optimizer.step()
+                (loss + peer_loss).backward()
+                optimizer.step()
+                peer_optimizer.step()
         else:
             raise ValueError(f"Unsupported method '{method}'")
 
@@ -324,11 +402,21 @@ def main():
     peer_optimizer = None
     if uses_peer_model(args.method):
         peer_model = build_operator_model(pair_meta["peer_model"], args.dataset, meta).to(device)
+    loaded_init_checkpoint = load_model_checkpoint(model, args.init_checkpoint, "init")
+    loaded_peer_init_checkpoint = None
+    if peer_model is not None:
+        loaded_peer_init_checkpoint = load_model_checkpoint(peer_model, args.peer_init_checkpoint, "peer_init")
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     if peer_model is not None:
         peer_optimizer = torch.optim.AdamW(peer_model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    peer_update_disabled = args.method == "ssml" and (args.ssml_student_only or args.ssml_freeze_peer)
+    if peer_model is not None and peer_update_disabled:
+        for param in peer_model.parameters():
+            param.requires_grad_(False)
+        peer_optimizer = None
     supervised_loss_fn = build_regression_imitation_loss_fn("mse")
+    supervised_elementwise_loss_fn = build_regression_elementwise_loss_fn("mse")
     imitation_loss_fn = build_regression_imitation_loss_fn(args.regression_imitation_loss)
     elementwise_imitation_loss_fn = build_regression_elementwise_loss_fn(args.regression_imitation_loss)
 
@@ -340,6 +428,13 @@ def main():
     )
     print(f"[operator] run_dir={run_dir}")
     print(f"[operator] params={count_parameters(model)}")
+    print(
+        "[operator] "
+        f"granularity={args.operator_weight_granularity} "
+        f"student_only={args.ssml_student_only} "
+        f"freeze_peer={args.ssml_freeze_peer} "
+        f"peer_updates_disabled={peer_update_disabled}"
+    )
 
     train_mse_curve = []
     val_mse_curve = []
@@ -369,12 +464,15 @@ def main():
             peer_optimizer,
             device,
             supervised_loss_fn=supervised_loss_fn,
+            supervised_elementwise_loss_fn=supervised_elementwise_loss_fn,
             imitation_loss_fn=imitation_loss_fn,
             elementwise_imitation_loss_fn=elementwise_imitation_loss_fn,
             lambda_imitation=effective_lambda,
             margin=args.margin,
             method=args.method,
             hetero_ssml_one_way=hetero_ssml_one_way,
+            peer_update_disabled=peer_update_disabled,
+            operator_weight_granularity=args.operator_weight_granularity,
         )
         va_mse, va_mae = evaluate(model, val_loader, device)
         peer_va_mse = None
@@ -454,6 +552,10 @@ def main():
         "imitation_decay_end_epoch": args.imitation_decay_end_epoch,
         "imitation_decay_min_scale": args.imitation_decay_min_scale,
         "hetero_ssml_one_way": hetero_ssml_one_way,
+        "ssml_student_only": args.ssml_student_only,
+        "ssml_freeze_peer": args.ssml_freeze_peer,
+        "peer_update_disabled": peer_update_disabled,
+        "operator_weight_granularity": args.operator_weight_granularity,
         "dml_rule": "supervised_all_plus_soft_peer_better_imitation",
         "ssml_rule": "supervised_all_plus_hard_peer_better_imitation",
         "ssml_directionality": "hetero_weaker_to_stronger_only" if hetero_ssml_one_way else "bidirectional",
@@ -473,6 +575,8 @@ def main():
         "final_val1": val_mse_curve[-1],
         "num_parameters": count_parameters(model),
         "num_parameters1": count_parameters(model),
+        "init_checkpoint": loaded_init_checkpoint,
+        "peer_init_checkpoint": loaded_peer_init_checkpoint,
         "meta": meta,
     }
     if peer_model is not None:

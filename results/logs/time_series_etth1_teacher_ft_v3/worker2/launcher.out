@@ -1,0 +1,85 @@
+[time_series_etth1_teacher_ft_v3] output_root=results/time_series_etth1_teacher_ft_v3/worker2_gpu0
+[time_series_etth1_teacher_ft_v3] gpu=0 seeds=0 1 2 epochs=80 batch_size=768
+[time_series_etth1_teacher_ft_v3] init_checkpoint_template=results/time_series_etth1_all_methods_long_v3/time_series/etth1/{model}_independent_huber_seed{seed}/best_model.pt
+[time_series_etth1_teacher_ft_v3] peer_init_checkpoint_template=results/time_series_etth1_all_methods_long_v3/time_series/etth1/{model}_independent_huber_seed{seed}/best_model.pt
+[time_series_etth1_teacher_ft_v3] correction_threshold=0.05
+[time_series_etth1_teacher_ft_v3] allowed_cases_file=scripts/paper_rerun/configs/etth1_teacher_ft_v3_allowed_cases.txt
+[time_series_etth1_teacher_ft_v3] case_specs=b12_q80_m20_t18_r00_lr3e4:0.0003:0.010:0.00003:96:0.00:-0.60:12:24:0.12:0.08:0.12:13:0.07:1.8:0.0:0.80:0.0020:3:0.12:4:20:34:0.00
+[time_series_etth1_teacher_ft_v3/b12_q80_m20_t18_r00_lr3e4] log -> results/logs/time_series_etth1_teacher_ft_v3/worker2/cases/b12_q80_m20_t18_r00_lr3e4.log
+[time_series_etth1_teacher_ft_v3/b12_q80_m20_t18_r00_lr3e4] [time_series] output_dir=results/time_series_etth1_teacher_ft_v3/worker2_gpu0/b12_q80_m20_t18_r00_lr3e4
+[time_series_etth1_teacher_ft_v3/b12_q80_m20_t18_r00_lr3e4] [time_series] methods=ssml
+[time_series_etth1_teacher_ft_v3/b12_q80_m20_t18_r00_lr3e4] [time_series] model_pairs=transformer:dlinear
+[time_series_etth1_teacher_ft_v3/b12_q80_m20_t18_r00_lr3e4] [time_series] lr=0.0003 weight_decay=0.0
+[time_series_etth1_teacher_ft_v3/b12_q80_m20_t18_r00_lr3e4] [time_series] ssml_topk_ratio=0.3
+[time_series_etth1_teacher_ft_v3/b12_q80_m20_t18_r00_lr3e4] [time_series] ssml_topk_scope=total
+[time_series_etth1_teacher_ft_v3/b12_q80_m20_t18_r00_lr3e4] [time_series] ssml_max_selected_ratio=1.0
+[time_series_etth1_teacher_ft_v3/b12_q80_m20_t18_r00_lr3e4] [time_series] ssml_adaptive_dense_threshold=1.1
+[time_series_etth1_teacher_ft_v3/b12_q80_m20_t18_r00_lr3e4] [time_series] ssml_adaptive_dense_topk_ratio=1.0
+[time_series_etth1_teacher_ft_v3/b12_q80_m20_t18_r00_lr3e4] [time_series] ssml_adaptive_dense_topk_scope=positive
+[time_series_etth1_teacher_ft_v3/b12_q80_m20_t18_r00_lr3e4] [time_series] ssml_adaptive_dense_max_selected_ratio=1.0
+[time_series_etth1_teacher_ft_v3/b12_q80_m20_t18_r00_lr3e4] [time_series] ssml_adaptive_dense_score_smoothing_kernel=-1
+[time_series_etth1_teacher_ft_v3/b12_q80_m20_t18_r00_lr3e4] [time_series] ssml_adaptive_dense_window_expand_kernel=-1
+[time_series_etth1_teacher_ft_v3/b12_q80_m20_t18_r00_lr3e4] [time_series] ssml_supervised_hotspot_alpha=0.0
+[time_series_etth1_teacher_ft_v3/b12_q80_m20_t18_r00_lr3e4] [time_series] ssml_supervised_weight_mode=score
+[time_series_etth1_teacher_ft_v3/b12_q80_m20_t18_r00_lr3e4] [time_series] ssml_gate_score_mode=peer_better_student_error
+[time_series_etth1_teacher_ft_v3/b12_q80_m20_t18_r00_lr3e4] [time_series] ssml_score_transform=none
+[time_series_etth1_teacher_ft_v3/b12_q80_m20_t18_r00_lr3e4] [time_series] ssml_positive_upper_quantile=1.0
+[time_series_etth1_teacher_ft_v3/b12_q80_m20_t18_r00_lr3e4] [time_series] ssml_guidance_mode=corrective
+[time_series_etth1_teacher_ft_v3/b12_q80_m20_t18_r00_lr3e4] [time_series] ssml_correction_gate_hidden_dim=96
+[time_series_etth1_teacher_ft_v3/b12_q80_m20_t18_r00_lr3e4] [time_series] ssml_correction_gate_dropout=0.00
+[time_series_etth1_teacher_ft_v3/b12_q80_m20_t18_r00_lr3e4] [time_series] ssml_correction_init_bias=-0.60
+[time_series_etth1_teacher_ft_v3/b12_q80_m20_t18_r00_lr3e4] [time_series] ssml_correction_sparsity_weight=0.00003
+[time_series_etth1_teacher_ft_v3/b12_q80_m20_t18_r00_lr3e4] [time_series] ssml_correction_threshold=0.05
+[time_series_etth1_teacher_ft_v3/b12_q80_m20_t18_r00_lr3e4] [time_series] ssml_correction_ramp_start_epoch=12
+[time_series_etth1_teacher_ft_v3/b12_q80_m20_t18_r00_lr3e4] [time_series] ssml_correction_ramp_end_epoch=24
+[time_series_etth1_teacher_ft_v3/b12_q80_m20_t18_r00_lr3e4] [time_series] ssml_correction_freeze_student_epochs=0
+[time_series_etth1_teacher_ft_v3/b12_q80_m20_t18_r00_lr3e4] [time_series] ssml_correction_only=1
+[time_series_etth1_teacher_ft_v3/b12_q80_m20_t18_r00_lr3e4] [time_series] ssml_correction_tail_start_ratio=0.12
+[time_series_etth1_teacher_ft_v3/b12_q80_m20_t18_r00_lr3e4] [time_series] ssml_correction_regime_focus_quantile=0.08
+[time_series_etth1_teacher_ft_v3/b12_q80_m20_t18_r00_lr3e4] [time_series] ssml_correction_focus_loss_alpha=0.12
+[time_series_etth1_teacher_ft_v3/b12_q80_m20_t18_r00_lr3e4] [time_series] ssml_correction_peer_advantage_quantile=0.80
+[time_series_etth1_teacher_ft_v3/b12_q80_m20_t18_r00_lr3e4] [time_series] ssml_correction_peer_advantage_min=0.0020
+[time_series_etth1_teacher_ft_v3/b12_q80_m20_t18_r00_lr3e4] [time_series] ssml_correction_peer_advantage_smoothing_kernel=3
+[time_series_etth1_teacher_ft_v3/b12_q80_m20_t18_r00_lr3e4] [time_series] ssml_correction_budget_ratio=0.12
+[time_series_etth1_teacher_ft_v3/b12_q80_m20_t18_r00_lr3e4] [time_series] ssml_correction_feature_mode=trend_residual
+[time_series_etth1_teacher_ft_v3/b12_q80_m20_t18_r00_lr3e4] [time_series] ssml_correction_use_regime_features=1
+[time_series_etth1_teacher_ft_v3/b12_q80_m20_t18_r00_lr3e4] [time_series] ssml_correction_decomposition_kernel=13
+[time_series_etth1_teacher_ft_v3/b12_q80_m20_t18_r00_lr3e4] [time_series] ssml_correction_trend_scale=1.8
+[time_series_etth1_teacher_ft_v3/b12_q80_m20_t18_r00_lr3e4] [time_series] ssml_correction_residual_scale=0.0
+[time_series_etth1_teacher_ft_v3/b12_q80_m20_t18_r00_lr3e4] [time_series] ssml_score_smoothing_kernel=1
+[time_series_etth1_teacher_ft_v3/b12_q80_m20_t18_r00_lr3e4] [time_series] ssml_window_score_kernel=1
+[time_series_etth1_teacher_ft_v3/b12_q80_m20_t18_r00_lr3e4] [time_series] ssml_window_expand_kernel=1
+[time_series_etth1_teacher_ft_v3/b12_q80_m20_t18_r00_lr3e4] [time_series] ssml_tail_start_ratio=0.0
+[time_series_etth1_teacher_ft_v3/b12_q80_m20_t18_r00_lr3e4] [time_series] ssml_residual_beta=1.0
+[time_series_etth1_teacher_ft_v3/b12_q80_m20_t18_r00_lr3e4] [time_series] ssml_ema_decay=0.0
+[time_series_etth1_teacher_ft_v3/b12_q80_m20_t18_r00_lr3e4] [time_series] ssml_imitation_space=raw
+[time_series_etth1_teacher_ft_v3/b12_q80_m20_t18_r00_lr3e4] [time_series] ssml_residual_space_kernel=9
+[time_series_etth1_teacher_ft_v3/b12_q80_m20_t18_r00_lr3e4] [time_series] ssml_conflict_aware_projection=0
+[time_series_etth1_teacher_ft_v3/b12_q80_m20_t18_r00_lr3e4] [time_series] ssml_freeze_peer=1
+[time_series_etth1_teacher_ft_v3/b12_q80_m20_t18_r00_lr3e4] [time_series] ssml_worse_only_update=0
+[time_series_etth1_teacher_ft_v3/b12_q80_m20_t18_r00_lr3e4] [time_series] ssml_anchor_weight=0.07
+[time_series_etth1_teacher_ft_v3/b12_q80_m20_t18_r00_lr3e4] [time_series] init_checkpoint_template=results/time_series_etth1_all_methods_long_v3/time_series/etth1/{model}_independent_huber_seed{seed}/best_model.pt
+[time_series_etth1_teacher_ft_v3/b12_q80_m20_t18_r00_lr3e4] [time_series] peer_init_checkpoint_template=results/time_series_etth1_all_methods_long_v3/time_series/etth1/{model}_independent_huber_seed{seed}/best_model.pt
+[time_series_etth1_teacher_ft_v3/b12_q80_m20_t18_r00_lr3e4] [time_series] early_stop_patience=0 early_stop_min_epochs=0 early_stop_min_delta=0.0
+[time_series_etth1_teacher_ft_v3/b12_q80_m20_t18_r00_lr3e4] [time_series] live_plot_interval=10
+[time_series_etth1_teacher_ft_v3/b12_q80_m20_t18_r00_lr3e4] [time_series] dataset=etth1 pair=transformer:dlinear method=ssml seed=0 pred_len=24
+[time_series_etth1_teacher_ft_v3/b12_q80_m20_t18_r00_lr3e4] [time_series] loaded init_checkpoint=results/time_series_etth1_all_methods_long_v3/time_series/etth1/transformer_independent_huber_seed0/best_model.pt
+[time_series_etth1_teacher_ft_v3/b12_q80_m20_t18_r00_lr3e4] [time_series] loaded peer_init_checkpoint=results/time_series_etth1_all_methods_long_v3/time_series/etth1/dlinear_independent_huber_seed0/best_model.pt
+[time_series_etth1_teacher_ft_v3/b12_q80_m20_t18_r00_lr3e4] [time_series] run_dir=results/time_series_etth1_teacher_ft_v3/worker2_gpu0/b12_q80_m20_t18_r00_lr3e4/time_series/etth1/transformer__dlinear_ssml_huber_seed0
+[time_series_etth1_teacher_ft_v3/b12_q80_m20_t18_r00_lr3e4] [time_series] params=1634
+[time_series_etth1_teacher_ft_v3/b12_q80_m20_t18_r00_lr3e4] [time_series] correction_gate_params=1634
+[time_series_etth1_teacher_ft_v3/b12_q80_m20_t18_r00_lr3e4] [time_series][epoch 001] lambda=0.0000 g_scale=0.000 corr_scale=0.000 freeze_student=0 focus=0.1324 train_total=0.21316300 train_sup=0.21316279 train_imit=0.49356522 mean_w=0.0068 active=0.0000 s_dense=0.00 s_pos=0.1231 s_sel=0.0000 s_sel_pos=0.0000 s_hot_err=0.000000 s_bg_err=0.207212 s_gap=0.000000 conf_cos=0.0000 conf_proj=0.00 val_mse=0.32025379 val_mae=0.38539263 | p_pos=0.0000 p_dense=0.00 p_sel=0.0000 p_sel_pos=0.0000 p_hot_err=0.000000 p_bg_err=0.000000 p_gap=0.000000 peer_val_mse=0.27126333 peer_val_mae=0.33938745
+[time_series_etth1_teacher_ft_v3/b12_q80_m20_t18_r00_lr3e4] [time_series][epoch 002] lambda=0.0000 g_scale=0.000 corr_scale=0.000 freeze_student=0 focus=0.1324 train_total=0.21316270 train_sup=0.21316251 train_imit=0.48848246 mean_w=0.0066 active=0.0000 s_dense=0.00 s_pos=0.1231 s_sel=0.0000 s_sel_pos=0.0000 s_hot_err=0.000000 s_bg_err=0.207212 s_gap=0.000000 conf_cos=0.0000 conf_proj=0.00 val_mse=0.32025379 val_mae=0.38539263 | p_pos=0.0000 p_dense=0.00 p_sel=0.0000 p_sel_pos=0.0000 p_hot_err=0.000000 p_bg_err=0.000000 p_gap=0.000000 peer_val_mse=0.27126333 peer_val_mae=0.33938745
+[time_series_etth1_teacher_ft_v3/b12_q80_m20_t18_r00_lr3e4] [time_series][epoch 003] lambda=0.0000 g_scale=0.000 corr_scale=0.000 freeze_student=0 focus=0.1324 train_total=0.21316291 train_sup=0.21316271 train_imit=0.48346268 mean_w=0.0064 active=0.0000 s_dense=0.00 s_pos=0.1231 s_sel=0.0000 s_sel_pos=0.0000 s_hot_err=0.000000 s_bg_err=0.207212 s_gap=0.000000 conf_cos=0.0000 conf_proj=0.00 val_mse=0.32025379 val_mae=0.38539263 | p_pos=0.0000 p_dense=0.00 p_sel=0.0000 p_sel_pos=0.0000 p_hot_err=0.000000 p_bg_err=0.000000 p_gap=0.000000 peer_val_mse=0.27126333 peer_val_mae=0.33938745
+[time_series_etth1_teacher_ft_v3/b12_q80_m20_t18_r00_lr3e4] [time_series][epoch 004] lambda=0.0000 g_scale=0.000 corr_scale=0.000 freeze_student=0 focus=0.1324 train_total=0.21316315 train_sup=0.21316296 train_imit=0.47857463 mean_w=0.0063 active=0.0000 s_dense=0.00 s_pos=0.1231 s_sel=0.0000 s_sel_pos=0.0000 s_hot_err=0.000000 s_bg_err=0.207212 s_gap=0.000000 conf_cos=0.0000 conf_proj=0.00 val_mse=0.32025379 val_mae=0.38539263 | p_pos=0.0000 p_dense=0.00 p_sel=0.0000 p_sel_pos=0.0000 p_hot_err=0.000000 p_bg_err=0.000000 p_gap=0.000000 peer_val_mse=0.27126333 peer_val_mae=0.33938745
+[time_series_etth1_teacher_ft_v3/b12_q80_m20_t18_r00_lr3e4] [time_series][epoch 005] lambda=0.0100 g_scale=1.000 corr_scale=0.000 freeze_student=0 focus=0.1324 train_total=0.21783013 train_sup=0.21316279 train_imit=0.46671532 mean_w=0.0061 active=0.0000 s_dense=0.00 s_pos=0.1231 s_sel=0.0000 s_sel_pos=0.0000 s_hot_err=0.000000 s_bg_err=0.207212 s_gap=0.000000 conf_cos=0.0000 conf_proj=0.00 val_mse=0.32025379 val_mae=0.38539263 | p_pos=0.0000 p_dense=0.00 p_sel=0.0000 p_sel_pos=0.0000 p_hot_err=0.000000 p_bg_err=0.000000 p_gap=0.000000 peer_val_mse=0.27126333 peer_val_mae=0.33938745
+[time_series_etth1_teacher_ft_v3/b12_q80_m20_t18_r00_lr3e4] [time_series][epoch 006] lambda=0.0100 g_scale=1.000 corr_scale=0.000 freeze_student=0 focus=0.1324 train_total=0.21759545 train_sup=0.21316261 train_imit=0.44326747 mean_w=0.0057 active=0.0000 s_dense=0.00 s_pos=0.1231 s_sel=0.0000 s_sel_pos=0.0000 s_hot_err=0.000000 s_bg_err=0.207212 s_gap=0.000000 conf_cos=0.0000 conf_proj=0.00 val_mse=0.32025379 val_mae=0.38539263 | p_pos=0.0000 p_dense=0.00 p_sel=0.0000 p_sel_pos=0.0000 p_hot_err=0.000000 p_bg_err=0.000000 p_gap=0.000000 peer_val_mse=0.27126333 peer_val_mae=0.33938745
+[time_series_etth1_teacher_ft_v3/b12_q80_m20_t18_r00_lr3e4] [time_series][epoch 007] lambda=0.0100 g_scale=1.000 corr_scale=0.000 freeze_student=0 focus=0.1324 train_total=0.21738846 train_sup=0.21316250 train_imit=0.42257945 mean_w=0.0053 active=0.0000 s_dense=0.00 s_pos=0.1231 s_sel=0.0000 s_sel_pos=0.0000 s_hot_err=0.000000 s_bg_err=0.207212 s_gap=0.000000 conf_cos=0.0000 conf_proj=0.00 val_mse=0.32025379 val_mae=0.38539263 | p_pos=0.0000 p_dense=0.00 p_sel=0.0000 p_sel_pos=0.0000 p_hot_err=0.000000 p_bg_err=0.000000 p_gap=0.000000 peer_val_mse=0.27126333 peer_val_mae=0.33938745
+[time_series_etth1_teacher_ft_v3/b12_q80_m20_t18_r00_lr3e4] [time_series][epoch 008] lambda=0.0100 g_scale=1.000 corr_scale=0.000 freeze_student=0 focus=0.1324 train_total=0.21721693 train_sup=0.21316252 train_imit=0.40542662 mean_w=0.0049 active=0.0000 s_dense=0.00 s_pos=0.1231 s_sel=0.0000 s_sel_pos=0.0000 s_hot_err=0.000000 s_bg_err=0.207212 s_gap=0.000000 conf_cos=0.0000 conf_proj=0.00 val_mse=0.32025379 val_mae=0.38539263 | p_pos=0.0000 p_dense=0.00 p_sel=0.0000 p_sel_pos=0.0000 p_hot_err=0.000000 p_bg_err=0.000000 p_gap=0.000000 peer_val_mse=0.27126333 peer_val_mae=0.33938745
+[time_series_etth1_teacher_ft_v3/b12_q80_m20_t18_r00_lr3e4] [time_series][epoch 009] lambda=0.0100 g_scale=1.000 corr_scale=0.000 freeze_student=0 focus=0.1324 train_total=0.21707684 train_sup=0.21316279 train_imit=0.39139145 mean_w=0.0046 active=0.0000 s_dense=0.00 s_pos=0.1231 s_sel=0.0000 s_sel_pos=0.0000 s_hot_err=0.000000 s_bg_err=0.207212 s_gap=0.000000 conf_cos=0.0000 conf_proj=0.00 val_mse=0.32025379 val_mae=0.38539263 | p_pos=0.0000 p_dense=0.00 p_sel=0.0000 p_sel_pos=0.0000 p_hot_err=0.000000 p_bg_err=0.000000 p_gap=0.000000 peer_val_mse=0.27126333 peer_val_mae=0.33938745
+[time_series_etth1_teacher_ft_v3/b12_q80_m20_t18_r00_lr3e4] [time_series][epoch 010] lambda=0.0100 g_scale=1.000 corr_scale=0.000 freeze_student=0 focus=0.1324 train_total=0.21696510 train_sup=0.21316275 train_imit=0.38022135 mean_w=0.0043 active=0.0000 s_dense=0.00 s_pos=0.1231 s_sel=0.0000 s_sel_pos=0.0000 s_hot_err=0.000000 s_bg_err=0.207212 s_gap=0.000000 conf_cos=0.0000 conf_proj=0.00 val_mse=0.32025379 val_mae=0.38539263 | p_pos=0.0000 p_dense=0.00 p_sel=0.0000 p_sel_pos=0.0000 p_hot_err=0.000000 p_bg_err=0.000000 p_gap=0.000000 peer_val_mse=0.27126333 peer_val_mae=0.33938745
+[time_series_etth1_teacher_ft_v3/b12_q80_m20_t18_r00_lr3e4] [time_series][epoch 010] updated live plot
+[time_series_etth1_teacher_ft_v3/b12_q80_m20_t18_r00_lr3e4] [time_series][epoch 011] lambda=0.0100 g_scale=1.000 corr_scale=0.000 freeze_student=0 focus=0.1324 train_total=0.21687834 train_sup=0.21316260 train_imit=0.37156241 mean_w=0.0040 active=0.0000 s_dense=0.00 s_pos=0.1231 s_sel=0.0000 s_sel_pos=0.0000 s_hot_err=0.000000 s_bg_err=0.207212 s_gap=0.000000 conf_cos=0.0000 conf_proj=0.00 val_mse=0.32025379 val_mae=0.38539263 | p_pos=0.0000 p_dense=0.00 p_sel=0.0000 p_sel_pos=0.0000 p_hot_err=0.000000 p_bg_err=0.000000 p_gap=0.000000 peer_val_mse=0.27126333 peer_val_mae=0.33938745
+[time_series_etth1_teacher_ft_v3/b12_q80_m20_t18_r00_lr3e4] [time_series][epoch 012] lambda=0.0100 g_scale=1.000 corr_scale=0.000 freeze_student=0 focus=0.1324 train_total=0.21681395 train_sup=0.21316262 train_imit=0.36512064 mean_w=0.0038 active=0.0000 s_dense=0.00 s_pos=0.1231 s_sel=0.0000 s_sel_pos=0.0000 s_hot_err=0.000000 s_bg_err=0.207212 s_gap=0.000000 conf_cos=0.0000 conf_proj=0.00 val_mse=0.32025379 val_mae=0.38539263 | p_pos=0.0000 p_dense=0.00 p_sel=0.0000 p_sel_pos=0.0000 p_hot_err=0.000000 p_bg_err=0.000000 p_gap=0.000000 peer_val_mse=0.27126333 peer_val_mae=0.33938745
+[time_series_etth1_teacher_ft_v3/b12_q80_m20_t18_r00_lr3e4] [time_series][epoch 013] lambda=0.0100 g_scale=1.000 corr_scale=0.083 freeze_student=0 focus=0.1324 train_total=0.21666390 train_sup=0.21305900 train_imit=0.36047962 mean_w=0.0036 active=0.0186 s_dense=0.00 s_pos=0.1231 s_sel=0.0186 s_sel_pos=0.1511 s_hot_err=0.599578 s_bg_err=0.199683 s_gap=0.238786 conf_cos=0.0000 conf_proj=0.00 val_mse=0.32001775 val_mae=0.38528192 | p_pos=0.0000 p_dense=0.00 p_sel=0.0000 p_sel_pos=0.0000 p_hot_err=0.000000 p_bg_err=0.000000 p_gap=0.000000 peer_val_mse=0.27126333 peer_val_mae=0.33938745
+[time_series_etth1_teacher_ft_v3/b12_q80_m20_t18_r00_lr3e4] [time_series][epoch 014] lambda=0.0100 g_scale=1.000 corr_scale=0.167 freeze_student=0 focus=0.1324 train_total=0.21652152 train_sup=0.21294710 train_imit=0.35743173 mean_w=0.0036 active=0.0186 s_dense=0.00 s_pos=0.1231 s_sel=0.0186 s_sel_pos=0.1511 s_hot_err=0.641110 s_bg_err=0.198793 s_gap=0.248902 conf_cos=0.0000 conf_proj=0.00 val_mse=0.31973858 val_mae=0.38515955 | p_pos=0.0000 p_dense=0.00 p_sel=0.0000 p_sel_pos=0.0000 p_hot_err=0.000000 p_bg_err=0.000000 p_gap=0.000000 peer_val_mse=0.27126333 peer_val_mae=0.33938745

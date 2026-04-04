@@ -1,0 +1,4 @@
+[time_series_electricity_dlinear_focus_v1] output_root=results/time_series_electricity_dlinear_focus_v1
+[time_series_electricity_dlinear_focus_v1] gpu=0 seeds=0 1 2
+[time_series_electricity_dlinear_focus_v1] model_pairs=dlinear:transformer
+[time_series_electricity_dlinear_focus_v1] case_specs=dlinear_best_known:0.30:0.05:5:20:50:0.10:1:0.30 dlinear_topk20:0.30:0.05:5:20:50:0.10:1:0.20 dlinear_lambda20:0.20:0.05:5:20:50:0.10:1:0.20

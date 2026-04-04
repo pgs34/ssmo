@@ -13,6 +13,8 @@ INDEPENDENT_MODELS="${INDEPENDENT_MODELS:-$(collect_unique_models "$MODEL_PAIRS"
 REQUIRE_DISTINCT_PEER="${REQUIRE_DISTINCT_PEER:-1}"
 EPOCHS="${EPOCHS:-150}"
 BATCH_SIZE="${BATCH_SIZE:-16}"
+LR="${LR:-1e-3}"
+WEIGHT_DECAY="${WEIGHT_DECAY:-0.0}"
 NUM_WORKERS="${NUM_WORKERS:-4}"
 DEVICE="${DEVICE:-cuda}"
 OUTPUT_DIR="${OUTPUT_DIR:-$(paper_results_root)/operator}"
@@ -24,6 +26,11 @@ IMITATION_DECAY_START_EPOCH="${IMITATION_DECAY_START_EPOCH:--1}"
 IMITATION_DECAY_END_EPOCH="${IMITATION_DECAY_END_EPOCH:--1}"
 IMITATION_DECAY_MIN_SCALE="${IMITATION_DECAY_MIN_SCALE:-1.0}"
 HETERO_SSML_ONE_WAY="${HETERO_SSML_ONE_WAY:-0}"
+SSML_STUDENT_ONLY="${SSML_STUDENT_ONLY:-0}"
+SSML_FREEZE_PEER="${SSML_FREEZE_PEER:-0}"
+OPERATOR_WEIGHT_GRANULARITY="${OPERATOR_WEIGHT_GRANULARITY:-sample}"
+INIT_CHECKPOINT_TEMPLATE="${INIT_CHECKPOINT_TEMPLATE:-}"
+PEER_INIT_CHECKPOINT_TEMPLATE="${PEER_INIT_CHECKPOINT_TEMPLATE:-}"
 DOWNLOAD="${DOWNLOAD:-0}"
 
 echo "[operator] output_dir=$OUTPUT_DIR"
@@ -42,6 +49,8 @@ for dataset in $DATASETS; do
             --dataset "$dataset"
             --epochs "$EPOCHS"
             --batch-size "$BATCH_SIZE"
+            --lr "$LR"
+            --weight-decay "$WEIGHT_DECAY"
             --num-workers "$NUM_WORKERS"
             --seed "$seed"
             --device "$DEVICE"
@@ -53,13 +62,19 @@ for dataset in $DATASETS; do
             --imitation-decay-start-epoch "$IMITATION_DECAY_START_EPOCH"
             --imitation-decay-end-epoch "$IMITATION_DECAY_END_EPOCH"
             --imitation-decay-min-scale "$IMITATION_DECAY_MIN_SCALE"
+            --operator-weight-granularity "$OPERATOR_WEIGHT_GRANULARITY"
           )
+
+          init_checkpoint="${INIT_CHECKPOINT_TEMPLATE//\{seed\}/$seed}"
 
           if [[ "$DOWNLOAD" == "1" ]]; then
             cmd+=(--download)
           fi
           if [[ "$HETERO_SSML_ONE_WAY" == "1" ]]; then
             cmd+=(--hetero-ssml-one-way)
+          fi
+          if [[ -n "$init_checkpoint" ]]; then
+            cmd+=(--init-checkpoint "$init_checkpoint")
           fi
 
           echo "[operator] dataset=$dataset model=$MODEL method=$method seed=$seed"
@@ -85,6 +100,8 @@ for dataset in $DATASETS; do
           --dataset "$dataset"
           --epochs "$EPOCHS"
           --batch-size "$BATCH_SIZE"
+          --lr "$LR"
+          --weight-decay "$WEIGHT_DECAY"
           --num-workers "$NUM_WORKERS"
           --seed "$seed"
           --device "$DEVICE"
@@ -96,13 +113,29 @@ for dataset in $DATASETS; do
           --imitation-decay-start-epoch "$IMITATION_DECAY_START_EPOCH"
           --imitation-decay-end-epoch "$IMITATION_DECAY_END_EPOCH"
           --imitation-decay-min-scale "$IMITATION_DECAY_MIN_SCALE"
+          --operator-weight-granularity "$OPERATOR_WEIGHT_GRANULARITY"
         )
+
+        init_checkpoint="${INIT_CHECKPOINT_TEMPLATE//\{seed\}/$seed}"
+        peer_init_checkpoint="${PEER_INIT_CHECKPOINT_TEMPLATE//\{seed\}/$seed}"
 
         if [[ "$DOWNLOAD" == "1" ]]; then
           cmd+=(--download)
         fi
         if [[ "$HETERO_SSML_ONE_WAY" == "1" ]]; then
           cmd+=(--hetero-ssml-one-way)
+        fi
+        if [[ "$SSML_STUDENT_ONLY" == "1" ]]; then
+          cmd+=(--ssml-student-only)
+        fi
+        if [[ "$SSML_FREEZE_PEER" == "1" ]]; then
+          cmd+=(--ssml-freeze-peer)
+        fi
+        if [[ -n "$init_checkpoint" ]]; then
+          cmd+=(--init-checkpoint "$init_checkpoint")
+        fi
+        if [[ -n "$peer_init_checkpoint" ]]; then
+          cmd+=(--peer-init-checkpoint "$peer_init_checkpoint")
         fi
 
         echo "[operator] dataset=$dataset pair=$MODEL:$PEER_MODEL method=$method seed=$seed"

@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/_common.sh"
+activate_paper_env
+cd "$ROOT_DIR"
+
+LOCK_ROOT="results/.locks"
+mkdir -p "$LOCK_ROOT"
+exec 9>"$LOCK_ROOT/launch_worker2_etth1_teacher_ft_v1.lock"
+flock -n 9 || {
+  echo "[worker2_etth1_teacher_ft_v1] launcher already running"
+  exit 0
+}
+
+LOG_DIR="${LOG_DIR:-results/logs/time_series_etth1_teacher_ft_v1/worker2}"
+mkdir -p "$LOG_DIR"
+
+run_logged_job \
+  "worker2/etth1_teacher_ft_v1" \
+  "$LOG_DIR/launcher.out" \
+  env \
+    GPU="${TIME_SERIES_GPU:-0}" \
+    DEVICE="${DEVICE:-cuda}" \
+    OUTPUT_ROOT="${OUTPUT_ROOT:-results/time_series_etth1_teacher_ft_v1}" \
+    LOG_DIR="${INNER_LOG_DIR:-results/logs/time_series_etth1_teacher_ft_v1/worker2/cases}" \
+    SEEDS="${SEEDS:-0 1 2}" \
+    EPOCHS="${EPOCHS:-90}" \
+    NUM_WORKERS="${NUM_WORKERS:-4}" \
+    BATCH_SIZE="${BATCH_SIZE:-768}" \
+    CASE_SPECS="${CASE_SPECS:-tft_tail20_reg20_l015_lr3e4:0.0003:0.015:0.00002:96:0.00:-0.40:12:30:0.20:0.20:0.20:9:0.10 tft_tail30_reg25_l020_lr4e4:0.0004:0.020:0.00005:96:0.00:-0.70:12:32:0.30:0.25:0.25:9:0.15}" \
+    bash scripts/paper_rerun/run_time_series_etth1_teacher_ft_v1.sh
+
+echo "[worker2_etth1_teacher_ft_v1] job finished"

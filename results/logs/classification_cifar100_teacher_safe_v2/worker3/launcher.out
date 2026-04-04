@@ -1,0 +1,6 @@
+[worker3/cifar100_teacher_safe_v2] log -> results/logs/classification_cifar100_teacher_safe_v2/worker3/classification_gpu0.log
+[worker3/cifar100_teacher_safe_v2] [classification_cifar100_teacher_safe_v2] gpu=0 seeds=0 1 2
+[worker3/cifar100_teacher_safe_v2] [classification_cifar100_teacher_safe_v2] pool_root=results/classification_cifar100_teacher_safe_v2_pool
+[worker3/cifar100_teacher_safe_v2] [classification_cifar100_teacher_safe_v2] output_root=results/classification_cifar100_teacher_safe_v2
+[worker3/cifar100_teacher_safe_v2] [classification_cifar100_teacher_safe_v2] case_specs=safegap35_thr45_gap2_spmax70_aw2e4:0.35:0.02:0.010:0.000:0.45:0.02:8:6.0:0.0002:0.70 safegap45_thr45_gap2_spmax70_aw2e4:0.45:0.02:0.010:0.000:0.45:0.02:10:6.0:0.0002:0.70 safegap35_thr50_gap3_spmax80_aw4e4:0.35:0.02:0.012:0.000:0.50:0.03:8:8.0:0.0004:0.80
+[worker3/cifar100_teacher_safe_v2] [classification_cifar100_teacher_safe_v2/independent_pool] log -> results/logs/classification_cifar100_teacher_safe_v2/independent_pool.log

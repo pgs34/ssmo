@@ -75,3 +75,32 @@ run_logged_job() {
         }' \
   )
 }
+
+sanitize_lock_name() {
+  printf '%s' "$1" | tr '/ :=' '____' | tr -cd '[:alnum:]_.-'
+}
+
+run_locked_job() {
+  local lock_key="$1"
+  local label="$2"
+  local logfile="$3"
+  shift 3
+
+  local lock_root="$ROOT_DIR/results/.locks"
+  local lock_name
+  local lock_file
+
+  mkdir -p "$lock_root"
+  lock_name="$(sanitize_lock_name "$lock_key")"
+  lock_file="$lock_root/${lock_name}.lock"
+
+  (
+    exec 9>"$lock_file"
+    if ! flock -n 9; then
+      echo "[$label] skip_locked lock=$lock_file"
+      exit 0
+    fi
+    echo "[$label] lock -> $lock_file"
+    run_logged_job "$label" "$logfile" "$@"
+  )
+}

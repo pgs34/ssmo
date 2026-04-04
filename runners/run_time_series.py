@@ -37,6 +37,35 @@ TIME_SERIES_MODEL_CHOICES = [
 TIME_SERIES_METHOD_CHOICES = ["independent", "dml", "ssml"]
 
 
+class TimeSeriesCorrectionGate(torch.nn.Module):
+    def __init__(
+        self,
+        input_dim: int = 5,
+        output_dim: int = 1,
+        hidden_dim: int = 32,
+        dropout: float = 0.0,
+        init_bias: float = 0.0,
+    ) -> None:
+        super().__init__()
+        self.output_dim = output_dim
+        output = torch.nn.Linear(hidden_dim, 1)
+        if output_dim != 1:
+            output = torch.nn.Linear(hidden_dim, output_dim)
+        torch.nn.init.constant_(output.bias, init_bias)
+        self.net = torch.nn.Sequential(
+            torch.nn.Linear(input_dim, hidden_dim),
+            torch.nn.GELU(),
+            torch.nn.Dropout(dropout),
+            output,
+        )
+
+    def forward(self, features: torch.Tensor) -> torch.Tensor:
+        logits = self.net(features)
+        if self.output_dim == 1:
+            return logits.squeeze(-1)
+        return logits
+
+
 def parse_args():
     p = argparse.ArgumentParser(description="Run time-series forecasting experiment")
     p.add_argument(
@@ -129,10 +158,39 @@ def parse_args():
         "--ssml-guidance-mode",
         type=str,
         default="hybrid",
-        choices=["hybrid", "reweight_only"],
+        choices=["hybrid", "reweight_only", "corrective"],
     )
+    p.add_argument("--ssml-correction-gate-hidden-dim", type=int, default=32)
+    p.add_argument("--ssml-correction-gate-dropout", type=float, default=0.0)
+    p.add_argument("--ssml-correction-init-bias", type=float, default=0.0)
+    p.add_argument("--ssml-correction-sparsity-weight", type=float, default=0.0)
+    p.add_argument("--ssml-correction-threshold", type=float, default=0.5)
+    p.add_argument("--ssml-correction-ramp-start-epoch", type=int, default=1)
+    p.add_argument("--ssml-correction-ramp-end-epoch", type=int, default=1)
+    p.add_argument("--ssml-correction-freeze-student-epochs", type=int, default=0)
+    p.add_argument("--ssml-correction-only", action="store_true")
+    p.add_argument("--ssml-correction-tail-start-ratio", type=float, default=0.0)
+    p.add_argument("--ssml-correction-regime-focus-quantile", type=float, default=0.0)
+    p.add_argument("--ssml-correction-focus-loss-alpha", type=float, default=0.0)
+    p.add_argument("--ssml-correction-peer-advantage-quantile", type=float, default=0.0)
+    p.add_argument("--ssml-correction-peer-advantage-min", type=float, default=0.0)
+    p.add_argument("--ssml-correction-peer-advantage-smoothing-kernel", type=int, default=1)
+    p.add_argument("--ssml-correction-budget-ratio", type=float, default=0.0)
+    p.add_argument(
+        "--ssml-correction-feature-mode",
+        type=str,
+        default="basic",
+        choices=["basic", "trend_residual"],
+    )
+    p.add_argument("--ssml-correction-use-regime-features", action="store_true")
+    p.add_argument("--ssml-correction-decomposition-kernel", type=int, default=9)
+    p.add_argument("--ssml-correction-trend-scale", type=float, default=1.0)
+    p.add_argument("--ssml-correction-residual-scale", type=float, default=1.0)
     p.add_argument("--init-checkpoint", type=str, default=None)
     p.add_argument("--peer-init-checkpoint", type=str, default=None)
+    p.add_argument("--early-stop-patience", type=int, default=0)
+    p.add_argument("--early-stop-min-epochs", type=int, default=0)
+    p.add_argument("--early-stop-min-delta", type=float, default=0.0)
     p.add_argument("--live-plot-interval", type=int, default=20)
     return p.parse_args()
 
@@ -526,7 +584,7 @@ def build_forecast_delta_representation(
     return torch.cat([first_delta, future_deltas], dim=1)
 
 
-def build_forecast_residual_representation(
+def build_forecast_trend_representation(
     forecast: torch.Tensor,
     kernel_size: int,
 ) -> torch.Tensor:
@@ -541,8 +599,23 @@ def build_forecast_residual_representation(
     pad = effective_kernel // 2
     padded = F.pad(flat, (pad, pad), mode="replicate")
     trend = F.avg_pool1d(padded, kernel_size=effective_kernel, stride=1)
-    trend = trend.reshape(batch, *trailing_shape, horizon).permute(0, forecast.ndim - 1, *range(1, forecast.ndim - 1))
-    return forecast - trend
+    return trend.reshape(batch, *trailing_shape, horizon).permute(0, forecast.ndim - 1, *range(1, forecast.ndim - 1))
+
+
+def decompose_forecast_trend_residual(
+    forecast: torch.Tensor,
+    kernel_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    trend = build_forecast_trend_representation(forecast, kernel_size)
+    return trend, forecast - trend
+
+
+def build_forecast_residual_representation(
+    forecast: torch.Tensor,
+    kernel_size: int,
+) -> torch.Tensor:
+    _, residual = decompose_forecast_trend_residual(forecast, kernel_size)
+    return residual
 
 
 def build_imitation_representation(
@@ -725,6 +798,24 @@ def compute_ssml_guidance_scale(
     return 1.0 + (decay_min_scale - 1.0) * progress
 
 
+def compute_correction_ramp_scale(
+    *,
+    epoch: int,
+    start_epoch: int,
+    end_epoch: int,
+) -> float:
+    start_epoch = max(start_epoch, 0)
+    end_epoch = max(end_epoch, 0)
+    if end_epoch <= start_epoch:
+        return 0.0 if epoch < start_epoch else 1.0
+    if epoch <= start_epoch:
+        return 0.0
+    if epoch >= end_epoch:
+        return 1.0
+    progress = (epoch - start_epoch) / max(end_epoch - start_epoch, 1)
+    return float(max(0.0, min(1.0, progress)))
+
+
 def choose_one_way_imitation_from_scores(
     student_scores: torch.Tensor,
     peer_scores: torch.Tensor,
@@ -742,11 +833,356 @@ def choose_one_way_imitation_from_scores(
     return False, False
 
 
+def extract_recent_target_context(
+    x: torch.Tensor,
+    pred_len: int,
+    num_targets: int,
+) -> torch.Tensor:
+    context = x[:, -min(pred_len, x.shape[1]) :, :num_targets]
+    if context.shape[1] == pred_len:
+        return context
+    pad = context[:, :1, :].expand(-1, pred_len - context.shape[1], -1)
+    return torch.cat([pad, context], dim=1)
+
+
+def build_context_regime_feature_maps(
+    context: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    if context.ndim != 3:
+        raise ValueError(f"Expected context with shape [B, H, C], got {tuple(context.shape)}")
+    pred_len = context.shape[1]
+    base = context[:, :1, :]
+    if pred_len <= 1:
+        zeros = torch.zeros_like(base).expand(-1, pred_len, -1)
+        return zeros, zeros, zeros
+
+    diffs = context[:, 1:, :] - context[:, :-1, :]
+    context_scale = torch.clamp(context.abs().mean(dim=1, keepdim=True), min=1e-6)
+    diff_scale = torch.clamp(diffs.abs().mean(dim=1, keepdim=True), min=1e-6)
+    slope = diffs.mean(dim=1, keepdim=True)
+    volatility = diffs.square().mean(dim=1, keepdim=True).sqrt()
+    if diffs.shape[1] > 1:
+        previous_diff_mean = diffs[:, :-1, :].mean(dim=1, keepdim=True)
+        last_diff = diffs[:, -1:, :]
+        change_point = (last_diff - previous_diff_mean).abs()
+    else:
+        change_point = diffs.abs()
+
+    slope_feature = torch.tanh(slope / torch.clamp(volatility, min=1e-6))
+    volatility_feature = torch.tanh(volatility / context_scale)
+    change_point_feature = torch.tanh(change_point / diff_scale)
+    return (
+        slope_feature.expand(-1, pred_len, -1),
+        volatility_feature.expand(-1, pred_len, -1),
+        change_point_feature.expand(-1, pred_len, -1),
+    )
+
+
+def build_correction_gate_features(
+    x: torch.Tensor,
+    student_pred: torch.Tensor,
+    teacher_pred: torch.Tensor,
+    *,
+    feature_mode: str,
+    use_regime_features: bool,
+    decomposition_kernel: int,
+) -> torch.Tensor:
+    context = extract_recent_target_context(
+        x,
+        pred_len=student_pred.shape[1],
+        num_targets=student_pred.shape[-1],
+    )
+    regime_features = []
+    if use_regime_features:
+        slope_feature, volatility_feature, change_point_feature = build_context_regime_feature_maps(context)
+        regime_features = [slope_feature, volatility_feature, change_point_feature]
+    if feature_mode == "basic":
+        delta = teacher_pred - student_pred
+        feature_tensors = [
+            context,
+            student_pred,
+            teacher_pred,
+            delta,
+            delta.abs(),
+            *regime_features,
+        ]
+        return torch.stack(feature_tensors, dim=-1)
+
+    if feature_mode == "trend_residual":
+        context_trend, context_residual = decompose_forecast_trend_residual(context, decomposition_kernel)
+        student_trend, student_residual = decompose_forecast_trend_residual(student_pred, decomposition_kernel)
+        teacher_trend, teacher_residual = decompose_forecast_trend_residual(teacher_pred, decomposition_kernel)
+        trend_delta = teacher_trend - student_trend
+        residual_delta = teacher_residual - student_residual
+        feature_tensors = [
+            context_trend,
+            context_residual,
+            context_residual.abs(),
+            student_trend,
+            teacher_trend,
+            trend_delta,
+            trend_delta.abs(),
+            student_residual,
+            teacher_residual,
+            residual_delta,
+            residual_delta.abs(),
+            *regime_features,
+        ]
+        return torch.stack(feature_tensors, dim=-1)
+
+    raise ValueError(f"Unsupported correction feature mode: {feature_mode}")
+
+
+def resolve_correction_gate_shape(
+    feature_mode: str,
+    use_regime_features: bool,
+) -> tuple[int, int]:
+    regime_dim = 3 if use_regime_features else 0
+    if feature_mode == "basic":
+        return 5 + regime_dim, 1
+    if feature_mode == "trend_residual":
+        return 11 + regime_dim, 2
+    raise ValueError(f"Unsupported correction feature mode: {feature_mode}")
+
+
+def compute_corrective_branch_masks(
+    student_pred: torch.Tensor,
+    teacher_pred: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    margin: float,
+    feature_mode: str,
+    decomposition_kernel: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if feature_mode == "basic":
+        teacher_better_mask = (
+            F.mse_loss(teacher_pred, target, reduction="none") + margin
+            < F.mse_loss(student_pred, target, reduction="none")
+        ).to(dtype=student_pred.dtype)
+        return teacher_better_mask, teacher_better_mask
+
+    if feature_mode == "trend_residual":
+        student_trend, student_residual = decompose_forecast_trend_residual(student_pred, decomposition_kernel)
+        teacher_trend, teacher_residual = decompose_forecast_trend_residual(teacher_pred, decomposition_kernel)
+        target_trend, target_residual = decompose_forecast_trend_residual(target, decomposition_kernel)
+        trend_teacher_better = (
+            F.mse_loss(teacher_trend, target_trend, reduction="none") + margin
+            < F.mse_loss(student_trend, target_trend, reduction="none")
+        ).to(dtype=student_pred.dtype)
+        residual_teacher_better = (
+            F.mse_loss(teacher_residual, target_residual, reduction="none") + margin
+            < F.mse_loss(student_residual, target_residual, reduction="none")
+        ).to(dtype=student_pred.dtype)
+        combined = torch.maximum(trend_teacher_better, residual_teacher_better)
+        branch_targets = torch.stack([trend_teacher_better, residual_teacher_better], dim=-1)
+        return combined, branch_targets
+
+    raise ValueError(f"Unsupported correction feature mode: {feature_mode}")
+
+
+def build_quantile_focus_mask(
+    scores: torch.Tensor,
+    candidate_mask: torch.Tensor,
+    quantile: float,
+) -> torch.Tensor:
+    if scores.shape != candidate_mask.shape:
+        raise ValueError(
+            f"Focus scores {tuple(scores.shape)} must match candidate mask {tuple(candidate_mask.shape)}"
+        )
+    if quantile <= 0.0:
+        return candidate_mask
+    flat_scores = scores.reshape(scores.shape[0], -1)
+    flat_candidates = candidate_mask.reshape(candidate_mask.shape[0], -1)
+    focused = torch.zeros_like(flat_candidates)
+    clamped_quantile = min(max(float(quantile), 0.0), 1.0)
+    for i in range(flat_scores.shape[0]):
+        row_candidates = flat_candidates[i]
+        if not bool(row_candidates.any().item()):
+            continue
+        candidate_scores = flat_scores[i][row_candidates]
+        cutoff = torch.quantile(candidate_scores, clamped_quantile)
+        row_focus = row_candidates & (flat_scores[i] >= cutoff)
+        if not bool(row_focus.any().item()):
+            top_idx = torch.argmax(flat_scores[i].masked_fill(~row_candidates, float("-inf")))
+            row_focus[top_idx] = True
+        focused[i] = row_focus
+    return focused.reshape_as(candidate_mask)
+
+
+def build_budgeted_gate_mask(
+    scores: torch.Tensor,
+    candidate_mask: torch.Tensor,
+    budget_ratio: float,
+) -> torch.Tensor:
+    if scores.shape != candidate_mask.shape:
+        raise ValueError(
+            f"Budget scores {tuple(scores.shape)} must match candidate mask {tuple(candidate_mask.shape)}"
+        )
+    if budget_ratio <= 0.0 or budget_ratio >= 1.0:
+        return candidate_mask
+
+    flat_scores = scores.reshape(scores.shape[0], -1)
+    flat_candidates = candidate_mask.reshape(candidate_mask.shape[0], -1)
+    budgeted = torch.zeros_like(flat_candidates)
+    clamped_ratio = min(max(float(budget_ratio), 0.0), 1.0)
+    for i in range(flat_scores.shape[0]):
+        row_candidates = flat_candidates[i]
+        candidate_count = int(row_candidates.sum().item())
+        if candidate_count == 0:
+            continue
+        k = max(1, min(candidate_count, math.ceil(candidate_count * clamped_ratio)))
+        if k >= candidate_count:
+            budgeted[i] = row_candidates
+            continue
+        masked_scores = flat_scores[i].masked_fill(~row_candidates, float("-inf"))
+        _, topk_indices = torch.topk(masked_scores, k=k, dim=0)
+        row_mask = torch.zeros_like(row_candidates)
+        row_mask[topk_indices] = True
+        budgeted[i] = row_mask & row_candidates
+    return budgeted.reshape_as(candidate_mask)
+
+
+def build_correction_focus_mask(
+    x: torch.Tensor,
+    reference: torch.Tensor,
+    *,
+    tail_start_ratio: float,
+    regime_focus_quantile: float,
+    student_pred: Optional[torch.Tensor] = None,
+    teacher_pred: Optional[torch.Tensor] = None,
+    target: Optional[torch.Tensor] = None,
+    peer_advantage_quantile: float = 0.0,
+    peer_advantage_min: float = 0.0,
+    peer_advantage_smoothing_kernel: int = 1,
+) -> torch.Tensor:
+    focus_mask = build_tail_horizon_mask(reference, tail_start_ratio)
+    if regime_focus_quantile > 0.0:
+        context = extract_recent_target_context(
+            x,
+            pred_len=reference.shape[1],
+            num_targets=reference.shape[-1],
+        )
+        slope_feature, volatility_feature, change_point_feature = build_context_regime_feature_maps(context)
+        regime_score = volatility_feature.abs() + change_point_feature.abs() + 0.5 * slope_feature.abs()
+        focus_mask = build_quantile_focus_mask(regime_score, focus_mask, regime_focus_quantile)
+
+    if (
+        (peer_advantage_quantile > 0.0 or peer_advantage_min > 0.0)
+        and student_pred is not None
+        and teacher_pred is not None
+        and target is not None
+    ):
+        teacher_advantage = torch.clamp(
+            F.mse_loss(student_pred.detach(), target.detach(), reduction="none")
+            - F.mse_loss(teacher_pred.detach(), target.detach(), reduction="none")
+            - peer_advantage_min,
+            min=0.0,
+        )
+        teacher_advantage = smooth_time_series_scores(
+            teacher_advantage,
+            peer_advantage_smoothing_kernel,
+        )
+        advantage_mask = focus_mask & (teacher_advantage > 0)
+        if bool(advantage_mask.any().item()):
+            if peer_advantage_quantile > 0.0:
+                focus_mask = build_quantile_focus_mask(
+                    teacher_advantage,
+                    advantage_mask,
+                    peer_advantage_quantile,
+                )
+            else:
+                focus_mask = advantage_mask
+
+    return focus_mask
+
+
+def compute_corrective_prediction(
+    x: torch.Tensor,
+    student_pred: torch.Tensor,
+    teacher_pred: torch.Tensor,
+    correction_gate: TimeSeriesCorrectionGate,
+    *,
+    guidance_scale: float,
+    feature_mode: str,
+    use_regime_features: bool,
+    decomposition_kernel: int,
+    trend_scale: float,
+    residual_scale: float,
+    budget_ratio: float,
+    focus_mask: Optional[torch.Tensor] = None,
+    detach_gate_inputs: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    gate_student_pred = student_pred.detach() if detach_gate_inputs else student_pred
+    gate_teacher_pred = teacher_pred.detach() if detach_gate_inputs else teacher_pred
+    gate_x = x.detach() if detach_gate_inputs else x
+    gate_features = build_correction_gate_features(
+        gate_x,
+        gate_student_pred,
+        gate_teacher_pred,
+        feature_mode=feature_mode,
+        use_regime_features=use_regime_features,
+        decomposition_kernel=decomposition_kernel,
+    )
+    gate_logits = correction_gate(gate_features)
+    focus = focus_mask.to(dtype=student_pred.dtype) if focus_mask is not None else None
+
+    if feature_mode == "trend_residual":
+        trend_gate = torch.sigmoid(gate_logits[..., 0])
+        residual_gate = torch.sigmoid(gate_logits[..., 1])
+        if focus is not None:
+            trend_gate = trend_gate * focus
+            residual_gate = residual_gate * focus
+        candidate_mask = (
+            focus > 0
+            if focus is not None
+            else torch.ones_like(trend_gate, dtype=torch.bool)
+        )
+        if 0.0 < budget_ratio < 1.0:
+            budget_mask = build_budgeted_gate_mask(
+                torch.maximum(trend_gate, residual_gate),
+                candidate_mask,
+                budget_ratio,
+            ).to(dtype=trend_gate.dtype)
+            trend_gate = trend_gate * budget_mask
+            residual_gate = residual_gate * budget_mask
+        student_trend, student_residual = decompose_forecast_trend_residual(student_pred, decomposition_kernel)
+        teacher_trend, teacher_residual = decompose_forecast_trend_residual(teacher_pred.detach(), decomposition_kernel)
+        corrected_pred = (
+            student_trend
+            + trend_gate * guidance_scale * trend_scale * (teacher_trend - student_trend)
+            + student_residual
+            + residual_gate * guidance_scale * residual_scale * (teacher_residual - student_residual)
+        )
+        effective_gate = torch.maximum(trend_gate, residual_gate)
+        return corrected_pred, effective_gate, gate_logits
+
+    delta = teacher_pred - student_pred
+    gate = torch.sigmoid(gate_logits)
+    if focus is not None:
+        gate = gate * focus
+    candidate_mask = (
+        focus > 0
+        if focus is not None
+        else torch.ones_like(gate, dtype=torch.bool)
+    )
+    if 0.0 < budget_ratio < 1.0:
+        budget_mask = build_budgeted_gate_mask(
+            gate,
+            candidate_mask,
+            budget_ratio,
+        ).to(dtype=gate.dtype)
+        gate = gate * budget_mask
+    scaled_gate = gate * guidance_scale
+    corrected_pred = student_pred + scaled_gate * (teacher_pred.detach() - student_pred)
+    return corrected_pred, gate, gate_logits
+
+
 def train_one_epoch(
     model,
     peer_model: Optional[torch.nn.Module],
     ema_model: Optional[torch.nn.Module],
     ema_peer_model: Optional[torch.nn.Module],
+    correction_gate: Optional[TimeSeriesCorrectionGate],
     loader,
     optimizer,
     peer_optimizer: Optional[torch.optim.Optimizer],
@@ -780,7 +1216,24 @@ def train_one_epoch(
     ssml_residual_space_kernel: int,
     ssml_conflict_aware_projection: bool,
     ssml_guidance_mode: str,
+    ssml_correction_sparsity_weight: float,
+    ssml_correction_threshold: float,
+    ssml_correction_only: bool,
+    ssml_correction_tail_start_ratio: float,
+    ssml_correction_regime_focus_quantile: float,
+    ssml_correction_focus_loss_alpha: float,
+    ssml_correction_peer_advantage_quantile: float,
+    ssml_correction_peer_advantage_min: float,
+    ssml_correction_peer_advantage_smoothing_kernel: int,
+    ssml_correction_budget_ratio: float,
+    ssml_correction_feature_mode: str,
+    ssml_correction_use_regime_features: bool,
+    ssml_correction_decomposition_kernel: int,
+    ssml_correction_trend_scale: float,
+    ssml_correction_residual_scale: float,
     guidance_scale: float,
+    correction_apply_scale: float,
+    correction_freeze_student: bool,
     method: str,
     hetero_ssml_one_way: bool = False,
     ssml_student_only: bool = False,
@@ -791,7 +1244,13 @@ def train_one_epoch(
 ):
     method = canonicalize_method_name(method)
     peer_update_disabled = ssml_student_only or ssml_freeze_peer
-    model.train()
+    correction_only = method == "ssml" and ssml_guidance_mode == "corrective" and ssml_correction_only
+    if correction_only:
+        model.eval()
+    else:
+        model.train()
+    if correction_gate is not None:
+        correction_gate.train()
     if peer_model is not None:
         if method == "ssml" and peer_update_disabled:
             peer_model.eval()
@@ -835,6 +1294,7 @@ def train_one_epoch(
     total_anchor_loss = 0.0
     total_conflict_cosine = 0.0
     total_conflict_projection_applied_ratio = 0.0
+    total_correction_focus_ratio = 0.0
     total_count = 0
     for x, y in loader:
         x = x.to(device, non_blocking=True)
@@ -842,7 +1302,11 @@ def train_one_epoch(
         optimizer.zero_grad(set_to_none=True)
         if peer_optimizer is not None:
             peer_optimizer.zero_grad(set_to_none=True)
-        pred = model(x)
+        if correction_only:
+            with torch.no_grad():
+                pred = model(x)
+        else:
+            pred = model(x)
         supervised_loss = supervised_loss_fn(pred, y)
         supervised_term_student = supervised_loss.mean()
         imitation_term_student = supervised_loss.new_tensor(0.0)
@@ -879,6 +1343,7 @@ def train_one_epoch(
         anchor_loss_metric = 0.0
         conflict_cosine_metric = 0.0
         conflict_projection_applied_ratio = 0.0
+        correction_focus_ratio_metric = 1.0
 
         if method == "independent":
             loss = supervised_term_student
@@ -933,280 +1398,384 @@ def train_one_epoch(
             peer_supervised_loss = sup_peer_elementwise.reshape(sup_peer_elementwise.shape[0], -1).mean(dim=1)
             zero = pred.new_tensor(0.0)
 
-            sup_student = sup_student_elementwise.detach()
-            sup_peer = sup_peer_elementwise.detach()
-            score_sup_student = smooth_time_series_scores(sup_student, ssml_window_score_kernel)
-            score_sup_peer = smooth_time_series_scores(sup_peer, ssml_window_score_kernel)
-            score_teacher_student = smooth_time_series_scores(
-                sup_teacher_student.detach(),
-                ssml_window_score_kernel,
-            )
-            score_teacher_peer = smooth_time_series_scores(
-                sup_teacher_peer.detach(),
-                ssml_window_score_kernel,
-            )
-            error_gap_student = sup_student - sup_teacher_student.detach()
-            error_gap_peer = sup_peer - sup_teacher_peer.detach()
+            if ssml_guidance_mode == "corrective":
+                if correction_gate is None:
+                    raise ValueError("correction_gate is required when ssml_guidance_mode='corrective'")
+                teacher_pred = peer_pred.detach()
+                student_pred_for_correction = pred.detach() if correction_freeze_student else pred
+                correction_focus_mask = build_correction_focus_mask(
+                    x,
+                    pred.detach(),
+                    tail_start_ratio=ssml_correction_tail_start_ratio,
+                    regime_focus_quantile=ssml_correction_regime_focus_quantile,
+                    student_pred=pred.detach(),
+                    teacher_pred=teacher_pred.detach(),
+                    target=y.detach(),
+                    peer_advantage_quantile=ssml_correction_peer_advantage_quantile,
+                    peer_advantage_min=ssml_correction_peer_advantage_min,
+                    peer_advantage_smoothing_kernel=ssml_correction_peer_advantage_smoothing_kernel,
+                )
+                effective_correction_scale = guidance_scale * correction_apply_scale
+                corrected_pred, correction_gate_values, correction_gate_logits = compute_corrective_prediction(
+                    x,
+                    student_pred_for_correction,
+                    teacher_pred,
+                    correction_gate,
+                    guidance_scale=effective_correction_scale,
+                    feature_mode=ssml_correction_feature_mode,
+                    use_regime_features=ssml_correction_use_regime_features,
+                    decomposition_kernel=ssml_correction_decomposition_kernel,
+                    trend_scale=ssml_correction_trend_scale,
+                    residual_scale=ssml_correction_residual_scale,
+                    budget_ratio=ssml_correction_budget_ratio,
+                    focus_mask=correction_focus_mask,
+                )
+                corrected_sup_elementwise = F.mse_loss(corrected_pred, y, reduction="none")
+                correction_focus_weights = 1.0 + ssml_correction_focus_loss_alpha * correction_focus_mask.to(
+                    dtype=corrected_sup_elementwise.dtype
+                )
+                supervised_term_student = weighted_mean(corrected_sup_elementwise, correction_focus_weights)
+                teacher_better_mask, branch_teacher_better_mask = compute_corrective_branch_masks(
+                    pred.detach(),
+                    teacher_pred.detach(),
+                    y.detach(),
+                    margin=margin,
+                    feature_mode=ssml_correction_feature_mode,
+                    decomposition_kernel=ssml_correction_decomposition_kernel,
+                )
+                focused_teacher_better_mask = teacher_better_mask * correction_focus_mask.to(dtype=teacher_better_mask.dtype)
+                if branch_teacher_better_mask.ndim > correction_focus_mask.ndim:
+                    branch_focus_mask = correction_focus_mask.unsqueeze(-1).expand_as(branch_teacher_better_mask)
+                else:
+                    branch_focus_mask = correction_focus_mask
+                usefulness_loss = F.binary_cross_entropy_with_logits(
+                    correction_gate_logits,
+                    branch_teacher_better_mask * branch_focus_mask.to(dtype=branch_teacher_better_mask.dtype),
+                    weight=1.0 + ssml_correction_focus_loss_alpha * branch_focus_mask.to(dtype=correction_gate_logits.dtype),
+                )
+                sparsity_penalty = correction_gate_values.mean()
+                imitation_term_student = usefulness_loss
+                loss = (
+                    supervised_term_student
+                    + lambda_imitation * imitation_term_student
+                    + ssml_correction_sparsity_weight * sparsity_penalty
+                )
 
-            student_scores, _ = compute_ssml_element_scores(
-                score_sup_student,
-                score_teacher_student,
-                margin=margin,
-                score_mode=ssml_gate_score_mode,
-                score_transform=ssml_score_transform,
-            )
-            peer_scores, _ = compute_ssml_element_scores(
-                score_sup_peer,
-                score_teacher_peer,
-                margin=margin,
-                score_mode=ssml_gate_score_mode,
-                score_transform=ssml_score_transform,
-            )
-            worse_student_mask = sup_student > sup_peer
-            worse_peer_mask = sup_peer > sup_student
-            if ssml_worse_only_update:
-                student_scores = student_scores * worse_student_mask.to(dtype=student_scores.dtype)
-                peer_scores = peer_scores * worse_peer_mask.to(dtype=peer_scores.dtype)
+                loss.backward()
+                optimizer.step()
 
-            student_positive_ratio_raw = mask_ratio(student_scores > 0)
-            peer_positive_ratio_raw = mask_ratio(peer_scores > 0)
-            student_dense_cfg = resolve_adaptive_dense_ssml_params(
-                positive_ratio=student_positive_ratio_raw,
-                topk_ratio=ssml_topk_ratio,
-                topk_scope=ssml_topk_scope,
-                max_selected_ratio=ssml_max_selected_ratio,
-                score_smoothing_kernel=ssml_score_smoothing_kernel,
-                window_expand_kernel=ssml_window_expand_kernel,
-                adaptive_dense_threshold=ssml_adaptive_dense_threshold,
-                adaptive_dense_topk_ratio=ssml_adaptive_dense_topk_ratio,
-                adaptive_dense_topk_scope=ssml_adaptive_dense_topk_scope,
-                adaptive_dense_max_selected_ratio=ssml_adaptive_dense_max_selected_ratio,
-                adaptive_dense_score_smoothing_kernel=ssml_adaptive_dense_score_smoothing_kernel,
-                adaptive_dense_window_expand_kernel=ssml_adaptive_dense_window_expand_kernel,
-            )
-            peer_dense_cfg = resolve_adaptive_dense_ssml_params(
-                positive_ratio=peer_positive_ratio_raw,
-                topk_ratio=ssml_topk_ratio,
-                topk_scope=ssml_topk_scope,
-                max_selected_ratio=ssml_max_selected_ratio,
-                score_smoothing_kernel=ssml_score_smoothing_kernel,
-                window_expand_kernel=ssml_window_expand_kernel,
-                adaptive_dense_threshold=ssml_adaptive_dense_threshold,
-                adaptive_dense_topk_ratio=ssml_adaptive_dense_topk_ratio,
-                adaptive_dense_topk_scope=ssml_adaptive_dense_topk_scope,
-                adaptive_dense_max_selected_ratio=ssml_adaptive_dense_max_selected_ratio,
-                adaptive_dense_score_smoothing_kernel=ssml_adaptive_dense_score_smoothing_kernel,
-                adaptive_dense_window_expand_kernel=ssml_adaptive_dense_window_expand_kernel,
-            )
-            student_scores = smooth_time_series_scores(
-                student_scores,
-                int(student_dense_cfg["score_smoothing_kernel"]),
-            )
-            peer_scores = smooth_time_series_scores(
-                peer_scores,
-                int(peer_dense_cfg["score_smoothing_kernel"]),
-            )
-            if ssml_tail_start_ratio > 0.0:
-                tail_mask_student = build_tail_horizon_mask(student_scores, ssml_tail_start_ratio)
-                tail_mask_peer = build_tail_horizon_mask(peer_scores, ssml_tail_start_ratio)
-                student_scores = student_scores * tail_mask_student.to(dtype=student_scores.dtype)
-                peer_scores = peer_scores * tail_mask_peer.to(dtype=peer_scores.dtype)
+                mean_weight_metric = float(correction_gate_values.mean().item())
+                if effective_correction_scale <= 0.0:
+                    active_mask = torch.zeros_like(correction_gate_values, dtype=torch.bool)
+                else:
+                    active_mask = (correction_gate_values > ssml_correction_threshold) & correction_focus_mask
+                active_ratio_metric = mask_ratio(active_mask)
+                correction_focus_ratio_metric = mask_ratio(correction_focus_mask)
+                student_positive_ratio = mask_ratio(focused_teacher_better_mask > 0)
+                student_selected_ratio = active_ratio_metric
+                if student_positive_ratio > 0.0:
+                    student_selected_of_positive_ratio = student_selected_ratio / student_positive_ratio
+                student_selected_score_mean = masked_tensor_mean(correction_gate_values, active_mask)
+                student_hotspot_error_mean = masked_tensor_mean(corrected_sup_elementwise.detach(), active_mask)
+                student_background_error_mean = masked_tensor_mean(corrected_sup_elementwise.detach(), ~active_mask)
+                student_hotspot_gap_mean = masked_tensor_mean(
+                    (sup_student_elementwise.detach() - sup_peer_elementwise.detach()),
+                    active_mask,
+                )
+                student_hotspot_error_share = masked_tensor_mean(
+                    focused_teacher_better_mask,
+                    active_mask,
+                )
+                student_error_mean = float(corrected_sup_elementwise.detach().mean().item())
+                student_score_p90 = safe_quantile(correction_gate_values, 0.9)
+                student_worse_ratio = mask_ratio(focused_teacher_better_mask > 0)
+                student_worse_update_ratio = masked_tensor_mean(
+                    focused_teacher_better_mask,
+                    active_mask,
+                )
+                student_update_ratio = active_ratio_metric
+                anchor_loss_metric = float(sparsity_penalty.item())
+                peer_error_mean = float(sup_peer_elementwise.detach().mean().item())
+                continue_batch = False
+            else:
+                continue_batch = True
 
-            mask_student_imitate = build_topk_element_mask(
-                student_scores,
-                float(student_dense_cfg["topk_ratio"]),
-                scope=str(student_dense_cfg["topk_scope"]),
-                positive_upper_quantile=ssml_positive_upper_quantile,
-            )
-            mask_peer_imitate = build_topk_element_mask(
-                peer_scores,
-                float(peer_dense_cfg["topk_ratio"]),
-                scope=str(peer_dense_cfg["topk_scope"]),
-                positive_upper_quantile=ssml_positive_upper_quantile,
-            )
-            mask_student_imitate = expand_time_series_mask(
-                mask_student_imitate,
-                int(student_dense_cfg["window_expand_kernel"]),
-            )
-            mask_peer_imitate = expand_time_series_mask(
-                mask_peer_imitate,
-                int(peer_dense_cfg["window_expand_kernel"]),
-            )
-            mask_student_imitate = limit_element_mask_by_ratio(
-                student_scores,
-                mask_student_imitate,
-                float(student_dense_cfg["max_selected_ratio"]),
-            )
-            mask_peer_imitate = limit_element_mask_by_ratio(
-                peer_scores,
-                mask_peer_imitate,
-                float(peer_dense_cfg["max_selected_ratio"]),
-            )
+            if continue_batch:
+                sup_student = sup_student_elementwise.detach()
+                sup_peer = sup_peer_elementwise.detach()
+                score_sup_student = smooth_time_series_scores(sup_student, ssml_window_score_kernel)
+                score_sup_peer = smooth_time_series_scores(sup_peer, ssml_window_score_kernel)
+                score_teacher_student = smooth_time_series_scores(
+                    sup_teacher_student.detach(),
+                    ssml_window_score_kernel,
+                )
+                score_teacher_peer = smooth_time_series_scores(
+                    sup_teacher_peer.detach(),
+                    ssml_window_score_kernel,
+                )
+                error_gap_student = sup_student - sup_teacher_student.detach()
+                error_gap_peer = sup_peer - sup_teacher_peer.detach()
 
-            if guidance_scale <= 0.0:
-                mask_student_imitate = torch.zeros_like(mask_student_imitate, dtype=torch.bool)
-                mask_peer_imitate = torch.zeros_like(mask_peer_imitate, dtype=torch.bool)
-            elif lambda_imitation <= 0.0 and ssml_guidance_mode != "reweight_only":
-                mask_student_imitate = torch.zeros_like(mask_student_imitate, dtype=torch.bool)
-                mask_peer_imitate = torch.zeros_like(mask_peer_imitate, dtype=torch.bool)
-            elif hetero_ssml_one_way and ssml_guidance_mode != "reweight_only":
-                student_imitates, peer_imitates = choose_one_way_imitation_from_scores(
+                student_scores, _ = compute_ssml_element_scores(
+                    score_sup_student,
+                    score_teacher_student,
+                    margin=margin,
+                    score_mode=ssml_gate_score_mode,
+                    score_transform=ssml_score_transform,
+                )
+                peer_scores, _ = compute_ssml_element_scores(
+                    score_sup_peer,
+                    score_teacher_peer,
+                    margin=margin,
+                    score_mode=ssml_gate_score_mode,
+                    score_transform=ssml_score_transform,
+                )
+                worse_student_mask = sup_student > sup_peer
+                worse_peer_mask = sup_peer > sup_student
+                if ssml_worse_only_update:
+                    student_scores = student_scores * worse_student_mask.to(dtype=student_scores.dtype)
+                    peer_scores = peer_scores * worse_peer_mask.to(dtype=peer_scores.dtype)
+
+                student_positive_ratio_raw = mask_ratio(student_scores > 0)
+                peer_positive_ratio_raw = mask_ratio(peer_scores > 0)
+                student_dense_cfg = resolve_adaptive_dense_ssml_params(
+                    positive_ratio=student_positive_ratio_raw,
+                    topk_ratio=ssml_topk_ratio,
+                    topk_scope=ssml_topk_scope,
+                    max_selected_ratio=ssml_max_selected_ratio,
+                    score_smoothing_kernel=ssml_score_smoothing_kernel,
+                    window_expand_kernel=ssml_window_expand_kernel,
+                    adaptive_dense_threshold=ssml_adaptive_dense_threshold,
+                    adaptive_dense_topk_ratio=ssml_adaptive_dense_topk_ratio,
+                    adaptive_dense_topk_scope=ssml_adaptive_dense_topk_scope,
+                    adaptive_dense_max_selected_ratio=ssml_adaptive_dense_max_selected_ratio,
+                    adaptive_dense_score_smoothing_kernel=ssml_adaptive_dense_score_smoothing_kernel,
+                    adaptive_dense_window_expand_kernel=ssml_adaptive_dense_window_expand_kernel,
+                )
+                peer_dense_cfg = resolve_adaptive_dense_ssml_params(
+                    positive_ratio=peer_positive_ratio_raw,
+                    topk_ratio=ssml_topk_ratio,
+                    topk_scope=ssml_topk_scope,
+                    max_selected_ratio=ssml_max_selected_ratio,
+                    score_smoothing_kernel=ssml_score_smoothing_kernel,
+                    window_expand_kernel=ssml_window_expand_kernel,
+                    adaptive_dense_threshold=ssml_adaptive_dense_threshold,
+                    adaptive_dense_topk_ratio=ssml_adaptive_dense_topk_ratio,
+                    adaptive_dense_topk_scope=ssml_adaptive_dense_topk_scope,
+                    adaptive_dense_max_selected_ratio=ssml_adaptive_dense_max_selected_ratio,
+                    adaptive_dense_score_smoothing_kernel=ssml_adaptive_dense_score_smoothing_kernel,
+                    adaptive_dense_window_expand_kernel=ssml_adaptive_dense_window_expand_kernel,
+                )
+                student_scores = smooth_time_series_scores(
                     student_scores,
+                    int(student_dense_cfg["score_smoothing_kernel"]),
+                )
+                peer_scores = smooth_time_series_scores(
                     peer_scores,
+                    int(peer_dense_cfg["score_smoothing_kernel"]),
                 )
-                if not student_imitates:
-                    mask_student_imitate = torch.zeros_like(mask_student_imitate, dtype=torch.bool)
-                if not peer_imitates:
-                    mask_peer_imitate = torch.zeros_like(mask_peer_imitate, dtype=torch.bool)
-            if peer_update_disabled:
-                mask_peer_imitate = torch.zeros_like(mask_peer_imitate, dtype=torch.bool)
+                if ssml_tail_start_ratio > 0.0:
+                    tail_mask_student = build_tail_horizon_mask(student_scores, ssml_tail_start_ratio)
+                    tail_mask_peer = build_tail_horizon_mask(peer_scores, ssml_tail_start_ratio)
+                    student_scores = student_scores * tail_mask_student.to(dtype=student_scores.dtype)
+                    peer_scores = peer_scores * tail_mask_peer.to(dtype=peer_scores.dtype)
 
-            student_teacher_target = build_residual_teacher_target(pred, teacher_pred_student, ssml_residual_beta)
-            history_target = x[:, :, : pred.shape[-1]]
-            imit_student_source = build_imitation_representation(
-                pred,
-                history_target,
-                ssml_imitation_space,
-                ssml_residual_space_kernel,
-            )
-            imit_student_target = build_imitation_representation(
-                student_teacher_target,
-                history_target,
-                ssml_imitation_space,
-                ssml_residual_space_kernel,
-            )
-            imit_student = elementwise_imitation_loss_fn(imit_student_source, imit_student_target)
-            imitation_weight_student = build_elementwise_score_weights(
-                imit_student,
-                student_scores,
-                mask_student_imitate,
-            )
-            hotspot_weight_student = build_elementwise_hotspot_weights(
-                sup_student_elementwise,
-                student_scores,
-                mask_student_imitate,
-                ssml_supervised_hotspot_alpha * guidance_scale,
-                mode=ssml_supervised_weight_mode,
-            )
-            supervised_term_student = weighted_mean(sup_student_elementwise, hotspot_weight_student)
-            anchor_penalty = zero
-            if ssml_anchor_weight > 0.0 and anchor_params:
-                anchor_penalty = compute_anchor_penalty(model, anchor_params)
-                anchor_loss_metric = float(anchor_penalty.item())
-            supervised_objective_student = supervised_term_student + ssml_anchor_weight * anchor_penalty
-            if ssml_guidance_mode == "reweight_only":
-                imitation_term_student = zero
-                imitation_objective_student = zero
-                loss = supervised_objective_student
-            else:
-                imitation_term_student = weighted_mean(imit_student, imitation_weight_student)
-                imitation_objective_student = lambda_imitation * imitation_term_student
-                loss = supervised_objective_student + imitation_objective_student
-
-            hotspot_weight_peer = build_elementwise_hotspot_weights(
-                sup_peer_elementwise,
-                peer_scores,
-                mask_peer_imitate,
-                ssml_supervised_hotspot_alpha * guidance_scale,
-                mode=ssml_supervised_weight_mode,
-            )
-            supervised_term_peer = weighted_mean(sup_peer_elementwise, hotspot_weight_peer)
-            if peer_update_disabled:
-                imitation_term_peer = zero
-                peer_loss = zero
-            elif ssml_guidance_mode == "reweight_only":
-                imitation_term_peer = zero
-                peer_loss = supervised_term_peer
-            else:
-                peer_teacher_target = build_residual_teacher_target(peer_pred, teacher_pred_peer, ssml_residual_beta)
-                peer_history_target = x[:, :, : peer_pred.shape[-1]]
-                imit_peer_source = build_imitation_representation(
-                    peer_pred,
-                    peer_history_target,
-                    ssml_imitation_space,
-                    ssml_residual_space_kernel,
+            if continue_batch:
+                mask_student_imitate = build_topk_element_mask(
+                    student_scores,
+                    float(student_dense_cfg["topk_ratio"]),
+                    scope=str(student_dense_cfg["topk_scope"]),
+                    positive_upper_quantile=ssml_positive_upper_quantile,
                 )
-                imit_peer_target = build_imitation_representation(
-                    peer_teacher_target,
-                    peer_history_target,
-                    ssml_imitation_space,
-                    ssml_residual_space_kernel,
+                mask_peer_imitate = build_topk_element_mask(
+                    peer_scores,
+                    float(peer_dense_cfg["topk_ratio"]),
+                    scope=str(peer_dense_cfg["topk_scope"]),
+                    positive_upper_quantile=ssml_positive_upper_quantile,
                 )
-                imit_peer = elementwise_imitation_loss_fn(imit_peer_source, imit_peer_target)
-                imitation_weight_peer = build_elementwise_score_weights(
-                    imit_peer,
+                mask_student_imitate = expand_time_series_mask(
+                    mask_student_imitate,
+                    int(student_dense_cfg["window_expand_kernel"]),
+                )
+                mask_peer_imitate = expand_time_series_mask(
+                    mask_peer_imitate,
+                    int(peer_dense_cfg["window_expand_kernel"]),
+                )
+                mask_student_imitate = limit_element_mask_by_ratio(
+                    student_scores,
+                    mask_student_imitate,
+                    float(student_dense_cfg["max_selected_ratio"]),
+                )
+                mask_peer_imitate = limit_element_mask_by_ratio(
                     peer_scores,
                     mask_peer_imitate,
+                    float(peer_dense_cfg["max_selected_ratio"]),
                 )
-                imitation_term_peer = weighted_mean(imit_peer, imitation_weight_peer)
-                peer_loss = supervised_term_peer + lambda_imitation * imitation_term_peer
 
-            if peer_update_disabled:
-                if (
-                    ssml_conflict_aware_projection
-                    and ssml_guidance_mode != "reweight_only"
-                    and float(imitation_objective_student.detach().item()) > 0.0
-                ):
-                    trainable_params = [param for param in model.parameters() if param.requires_grad]
-                    _, conflict_cosine_metric, projection_applied = conflict_project_gradients(
-                        trainable_params,
-                        supervised_objective_student,
-                        imitation_objective_student,
+                if guidance_scale <= 0.0:
+                    mask_student_imitate = torch.zeros_like(mask_student_imitate, dtype=torch.bool)
+                    mask_peer_imitate = torch.zeros_like(mask_peer_imitate, dtype=torch.bool)
+                elif lambda_imitation <= 0.0 and ssml_guidance_mode != "reweight_only":
+                    mask_student_imitate = torch.zeros_like(mask_student_imitate, dtype=torch.bool)
+                    mask_peer_imitate = torch.zeros_like(mask_peer_imitate, dtype=torch.bool)
+                elif hetero_ssml_one_way and ssml_guidance_mode != "reweight_only":
+                    student_imitates, peer_imitates = choose_one_way_imitation_from_scores(
+                        student_scores,
+                        peer_scores,
                     )
-                    conflict_projection_applied_ratio = 1.0 if projection_applied else 0.0
-                    optimizer.step()
-                else:
-                    loss.backward()
-                    optimizer.step()
-            else:
-                (loss + peer_loss).backward()
-                optimizer.step()
-                peer_optimizer.step()
-                update_ema_model(ema_model, model, ssml_ema_decay)
-                update_ema_model(ema_peer_model, peer_model, ssml_ema_decay)
+                    if not student_imitates:
+                        mask_student_imitate = torch.zeros_like(mask_student_imitate, dtype=torch.bool)
+                    if not peer_imitates:
+                        mask_peer_imitate = torch.zeros_like(mask_peer_imitate, dtype=torch.bool)
+                if peer_update_disabled:
+                    mask_peer_imitate = torch.zeros_like(mask_peer_imitate, dtype=torch.bool)
 
-            mean_weight_metric = float(student_scores[mask_student_imitate].mean().item()) if bool(mask_student_imitate.any().item()) else 0.0
-            active_ratio_metric = mask_ratio(mask_student_imitate)
-            student_positive_ratio = student_positive_ratio_raw
-            peer_positive_ratio = peer_positive_ratio_raw
-            student_selected_ratio = mask_ratio(mask_student_imitate)
-            peer_selected_ratio = mask_ratio(mask_peer_imitate)
-            if student_positive_ratio > 0.0:
-                student_selected_of_positive_ratio = student_selected_ratio / student_positive_ratio
-            if peer_positive_ratio > 0.0:
-                peer_selected_of_positive_ratio = peer_selected_ratio / peer_positive_ratio
-            student_selected_score_mean = masked_tensor_mean(student_scores, mask_student_imitate)
-            peer_selected_score_mean = masked_tensor_mean(peer_scores, mask_peer_imitate)
-            student_hotspot_error_mean = masked_tensor_mean(sup_student, mask_student_imitate)
-            student_background_error_mean = masked_tensor_mean(sup_student, ~mask_student_imitate)
-            peer_hotspot_error_mean = masked_tensor_mean(sup_peer, mask_peer_imitate)
-            peer_background_error_mean = masked_tensor_mean(sup_peer, ~mask_peer_imitate)
-            student_hotspot_gap_mean = masked_tensor_mean(error_gap_student, mask_student_imitate)
-            peer_hotspot_gap_mean = masked_tensor_mean(error_gap_peer, mask_peer_imitate)
-            student_error_mean = float(sup_student.mean().item())
-            peer_error_mean = float(sup_peer.mean().item())
-            student_score_p90 = safe_quantile(student_scores, 0.9)
-            peer_score_p90 = safe_quantile(peer_scores, 0.9)
-            student_worse_ratio = mask_ratio(worse_student_mask)
-            peer_worse_ratio = mask_ratio(worse_peer_mask)
-            student_worse_update_ratio = masked_tensor_mean(
-                worse_student_mask.to(dtype=sup_student.dtype),
-                mask_student_imitate,
-            )
-            peer_worse_update_ratio = masked_tensor_mean(
-                worse_peer_mask.to(dtype=sup_peer.dtype),
-                mask_peer_imitate,
-            )
-            student_update_ratio = mask_ratio(mask_student_imitate)
-            peer_update_ratio = mask_ratio(mask_peer_imitate)
-            student_total_error = float(sup_student.sum().item())
-            peer_total_error = float(sup_peer.sum().item())
-            student_dense_mode_ratio = 1.0 if bool(student_dense_cfg["dense_mode"]) else 0.0
-            peer_dense_mode_ratio = 1.0 if bool(peer_dense_cfg["dense_mode"]) else 0.0
-            if student_total_error > 0.0 and bool(mask_student_imitate.any().item()):
-                student_hotspot_error_share = float((sup_student[mask_student_imitate].sum() / sup_student.sum()).item())
-            if peer_total_error > 0.0 and bool(mask_peer_imitate.any().item()):
-                peer_hotspot_error_share = float((sup_peer[mask_peer_imitate].sum() / sup_peer.sum()).item())
+                student_teacher_target = build_residual_teacher_target(pred, teacher_pred_student, ssml_residual_beta)
+                history_target = x[:, :, : pred.shape[-1]]
+                imit_student_source = build_imitation_representation(
+                    pred,
+                    history_target,
+                    ssml_imitation_space,
+                    ssml_residual_space_kernel,
+                )
+                imit_student_target = build_imitation_representation(
+                    student_teacher_target,
+                    history_target,
+                    ssml_imitation_space,
+                    ssml_residual_space_kernel,
+                )
+                imit_student = elementwise_imitation_loss_fn(imit_student_source, imit_student_target)
+                imitation_weight_student = build_elementwise_score_weights(
+                    imit_student,
+                    student_scores,
+                    mask_student_imitate,
+                )
+                hotspot_weight_student = build_elementwise_hotspot_weights(
+                    sup_student_elementwise,
+                    student_scores,
+                    mask_student_imitate,
+                    ssml_supervised_hotspot_alpha * guidance_scale,
+                    mode=ssml_supervised_weight_mode,
+                )
+                supervised_term_student = weighted_mean(sup_student_elementwise, hotspot_weight_student)
+                anchor_penalty = zero
+                if ssml_anchor_weight > 0.0 and anchor_params:
+                    anchor_penalty = compute_anchor_penalty(model, anchor_params)
+                    anchor_loss_metric = float(anchor_penalty.item())
+                supervised_objective_student = supervised_term_student + ssml_anchor_weight * anchor_penalty
+                if ssml_guidance_mode == "reweight_only":
+                    imitation_term_student = zero
+                    imitation_objective_student = zero
+                    loss = supervised_objective_student
+                else:
+                    imitation_term_student = weighted_mean(imit_student, imitation_weight_student)
+                    imitation_objective_student = lambda_imitation * imitation_term_student
+                    loss = supervised_objective_student + imitation_objective_student
+
+                hotspot_weight_peer = build_elementwise_hotspot_weights(
+                    sup_peer_elementwise,
+                    peer_scores,
+                    mask_peer_imitate,
+                    ssml_supervised_hotspot_alpha * guidance_scale,
+                    mode=ssml_supervised_weight_mode,
+                )
+                supervised_term_peer = weighted_mean(sup_peer_elementwise, hotspot_weight_peer)
+                if peer_update_disabled:
+                    imitation_term_peer = zero
+                    peer_loss = zero
+                elif ssml_guidance_mode == "reweight_only":
+                    imitation_term_peer = zero
+                    peer_loss = supervised_term_peer
+                else:
+                    peer_teacher_target = build_residual_teacher_target(peer_pred, teacher_pred_peer, ssml_residual_beta)
+                    peer_history_target = x[:, :, : peer_pred.shape[-1]]
+                    imit_peer_source = build_imitation_representation(
+                        peer_pred,
+                        peer_history_target,
+                        ssml_imitation_space,
+                        ssml_residual_space_kernel,
+                    )
+                    imit_peer_target = build_imitation_representation(
+                        peer_teacher_target,
+                        peer_history_target,
+                        ssml_imitation_space,
+                        ssml_residual_space_kernel,
+                    )
+                    imit_peer = elementwise_imitation_loss_fn(imit_peer_source, imit_peer_target)
+                    imitation_weight_peer = build_elementwise_score_weights(
+                        imit_peer,
+                        peer_scores,
+                        mask_peer_imitate,
+                    )
+                    imitation_term_peer = weighted_mean(imit_peer, imitation_weight_peer)
+                    peer_loss = supervised_term_peer + lambda_imitation * imitation_term_peer
+
+                if peer_update_disabled:
+                    if (
+                        ssml_conflict_aware_projection
+                        and ssml_guidance_mode != "reweight_only"
+                        and float(imitation_objective_student.detach().item()) > 0.0
+                    ):
+                        trainable_params = [param for param in model.parameters() if param.requires_grad]
+                        _, conflict_cosine_metric, projection_applied = conflict_project_gradients(
+                            trainable_params,
+                            supervised_objective_student,
+                            imitation_objective_student,
+                        )
+                        conflict_projection_applied_ratio = 1.0 if projection_applied else 0.0
+                        optimizer.step()
+                    else:
+                        loss.backward()
+                        optimizer.step()
+                else:
+                    (loss + peer_loss).backward()
+                    optimizer.step()
+                    peer_optimizer.step()
+                    update_ema_model(ema_model, model, ssml_ema_decay)
+                    update_ema_model(ema_peer_model, peer_model, ssml_ema_decay)
+
+                mean_weight_metric = float(student_scores[mask_student_imitate].mean().item()) if bool(mask_student_imitate.any().item()) else 0.0
+                active_ratio_metric = mask_ratio(mask_student_imitate)
+                student_positive_ratio = student_positive_ratio_raw
+                peer_positive_ratio = peer_positive_ratio_raw
+                student_selected_ratio = mask_ratio(mask_student_imitate)
+                peer_selected_ratio = mask_ratio(mask_peer_imitate)
+                if student_positive_ratio > 0.0:
+                    student_selected_of_positive_ratio = student_selected_ratio / student_positive_ratio
+                if peer_positive_ratio > 0.0:
+                    peer_selected_of_positive_ratio = peer_selected_ratio / peer_positive_ratio
+                student_selected_score_mean = masked_tensor_mean(student_scores, mask_student_imitate)
+                peer_selected_score_mean = masked_tensor_mean(peer_scores, mask_peer_imitate)
+                student_hotspot_error_mean = masked_tensor_mean(sup_student, mask_student_imitate)
+                student_background_error_mean = masked_tensor_mean(sup_student, ~mask_student_imitate)
+                peer_hotspot_error_mean = masked_tensor_mean(sup_peer, mask_peer_imitate)
+                peer_background_error_mean = masked_tensor_mean(sup_peer, ~mask_peer_imitate)
+                student_hotspot_gap_mean = masked_tensor_mean(error_gap_student, mask_student_imitate)
+                peer_hotspot_gap_mean = masked_tensor_mean(error_gap_peer, mask_peer_imitate)
+                student_error_mean = float(sup_student.mean().item())
+                peer_error_mean = float(sup_peer.mean().item())
+                student_score_p90 = safe_quantile(student_scores, 0.9)
+                peer_score_p90 = safe_quantile(peer_scores, 0.9)
+                student_worse_ratio = mask_ratio(worse_student_mask)
+                peer_worse_ratio = mask_ratio(worse_peer_mask)
+                student_worse_update_ratio = masked_tensor_mean(
+                    worse_student_mask.to(dtype=sup_student.dtype),
+                    mask_student_imitate,
+                )
+                peer_worse_update_ratio = masked_tensor_mean(
+                    worse_peer_mask.to(dtype=sup_peer.dtype),
+                    mask_peer_imitate,
+                )
+                student_update_ratio = mask_ratio(mask_student_imitate)
+                peer_update_ratio = mask_ratio(mask_peer_imitate)
+                student_total_error = float(sup_student.sum().item())
+                peer_total_error = float(sup_peer.sum().item())
+                student_dense_mode_ratio = 1.0 if bool(student_dense_cfg["dense_mode"]) else 0.0
+                peer_dense_mode_ratio = 1.0 if bool(peer_dense_cfg["dense_mode"]) else 0.0
+                if student_total_error > 0.0 and bool(mask_student_imitate.any().item()):
+                    student_hotspot_error_share = float((sup_student[mask_student_imitate].sum() / sup_student.sum()).item())
+                if peer_total_error > 0.0 and bool(mask_peer_imitate.any().item()):
+                    peer_hotspot_error_share = float((sup_peer[mask_peer_imitate].sum() / sup_peer.sum()).item())
 
         else:
             raise ValueError(f"Unsupported method '{method}'")
@@ -1248,6 +1817,7 @@ def train_one_epoch(
         total_anchor_loss += anchor_loss_metric * batch_size
         total_conflict_cosine += conflict_cosine_metric * batch_size
         total_conflict_projection_applied_ratio += conflict_projection_applied_ratio * batch_size
+        total_correction_focus_ratio += correction_focus_ratio_metric * batch_size
         total_count += batch_size
 
     denom = max(total_count, 1)
@@ -1288,12 +1858,37 @@ def train_one_epoch(
         "anchor_loss_mean": total_anchor_loss / denom,
         "conflict_cosine": total_conflict_cosine / denom,
         "conflict_projection_applied_ratio": total_conflict_projection_applied_ratio / denom,
+        "correction_focus_ratio": total_correction_focus_ratio / denom,
     }
 
 
 @torch.no_grad()
-def evaluate(model, loader, device):
+def evaluate(
+    model,
+    loader,
+    device,
+    *,
+    peer_model: Optional[torch.nn.Module] = None,
+    correction_gate: Optional[TimeSeriesCorrectionGate] = None,
+    guidance_scale: float = 1.0,
+    correction_apply_scale: float = 1.0,
+    correction_tail_start_ratio: float = 0.0,
+    correction_regime_focus_quantile: float = 0.0,
+    correction_peer_advantage_quantile: float = 0.0,
+    correction_peer_advantage_min: float = 0.0,
+    correction_peer_advantage_smoothing_kernel: int = 1,
+    correction_budget_ratio: float = 0.0,
+    correction_feature_mode: str = "basic",
+    correction_use_regime_features: bool = False,
+    correction_decomposition_kernel: int = 9,
+    correction_trend_scale: float = 1.0,
+    correction_residual_scale: float = 1.0,
+):
     model.eval()
+    if correction_gate is not None:
+        correction_gate.eval()
+    if peer_model is not None:
+        peer_model.eval()
     total_mse = 0.0
     total_mae = 0.0
     total_count = 0
@@ -1301,6 +1896,34 @@ def evaluate(model, loader, device):
         x = x.to(device, non_blocking=True)
         y = y.to(device, non_blocking=True)
         pred = model(x)
+        if correction_gate is not None and peer_model is not None:
+            teacher_pred = peer_model(x)
+            correction_focus_mask = build_correction_focus_mask(
+                x,
+                pred.detach(),
+                tail_start_ratio=correction_tail_start_ratio,
+                regime_focus_quantile=correction_regime_focus_quantile,
+                student_pred=pred.detach(),
+                teacher_pred=teacher_pred.detach(),
+                target=y.detach(),
+                peer_advantage_quantile=correction_peer_advantage_quantile,
+                peer_advantage_min=correction_peer_advantage_min,
+                peer_advantage_smoothing_kernel=correction_peer_advantage_smoothing_kernel,
+            )
+            pred, _, _ = compute_corrective_prediction(
+                x,
+                pred,
+                teacher_pred,
+                correction_gate,
+                guidance_scale=guidance_scale * correction_apply_scale,
+                focus_mask=correction_focus_mask,
+                feature_mode=correction_feature_mode,
+                use_regime_features=correction_use_regime_features,
+                decomposition_kernel=correction_decomposition_kernel,
+                trend_scale=correction_trend_scale,
+                residual_scale=correction_residual_scale,
+                budget_ratio=correction_budget_ratio,
+            )
         mse = F.mse_loss(pred, y)
         mae = F.l1_loss(pred, y)
         batch_size = x.size(0)
@@ -1340,10 +1963,12 @@ def main():
         num_features=int(meta["num_features"]),
         num_targets=int(meta["num_targets"]),
     ).to(device)
+    corrective_mode = args.method == "ssml" and args.ssml_guidance_mode == "corrective"
     peer_model = None
     peer_optimizer = None
     ema_model = None
     ema_peer_model = None
+    correction_gate = None
     if uses_peer_model(args.method):
         peer_model = build_time_series_model(
             model_name=pair_meta["peer_model"],
@@ -1356,9 +1981,26 @@ def main():
     loaded_peer_init_checkpoint = None
     if peer_model is not None:
         loaded_peer_init_checkpoint = load_model_checkpoint(peer_model, args.peer_init_checkpoint, "peer_init")
-    ssml_student_only = args.method == "ssml" and args.ssml_student_only and uses_peer_model(args.method)
-    ssml_freeze_peer = args.method == "ssml" and args.ssml_freeze_peer and uses_peer_model(args.method)
+    if corrective_mode:
+        correction_input_dim, correction_output_dim = resolve_correction_gate_shape(
+            args.ssml_correction_feature_mode,
+            args.ssml_correction_use_regime_features,
+        )
+        correction_gate = TimeSeriesCorrectionGate(
+            input_dim=correction_input_dim,
+            output_dim=correction_output_dim,
+            hidden_dim=args.ssml_correction_gate_hidden_dim,
+            dropout=args.ssml_correction_gate_dropout,
+            init_bias=args.ssml_correction_init_bias,
+        ).to(device)
+    correction_only = corrective_mode and args.ssml_correction_only
+    ssml_student_only = args.method == "ssml" and (args.ssml_student_only or corrective_mode) and uses_peer_model(args.method)
+    ssml_freeze_peer = args.method == "ssml" and (args.ssml_freeze_peer or corrective_mode) and uses_peer_model(args.method)
     peer_update_disabled = ssml_student_only or ssml_freeze_peer
+    if correction_only:
+        for param in model.parameters():
+            param.requires_grad_(False)
+        model.eval()
     if peer_model is not None and peer_update_disabled:
         for param in peer_model.parameters():
             param.requires_grad_(False)
@@ -1367,10 +2009,13 @@ def main():
         ema_model = clone_ema_model(model)
         ema_peer_model = clone_ema_model(peer_model)
     anchor_params = None
-    if args.method == "ssml" and args.ssml_anchor_weight > 0.0:
+    if args.method == "ssml" and args.ssml_anchor_weight > 0.0 and not correction_only:
         anchor_params = snapshot_trainable_parameters(model)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    optimizer_params = [] if correction_only else list(model.parameters())
+    if correction_gate is not None:
+        optimizer_params.extend(correction_gate.parameters())
+    optimizer = torch.optim.AdamW(optimizer_params, lr=args.lr, weight_decay=args.weight_decay)
     if peer_model is not None and not peer_update_disabled:
         peer_optimizer = torch.optim.AdamW(peer_model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     supervised_loss_fn = build_regression_imitation_loss_fn("mse")
@@ -1384,8 +2029,12 @@ def main():
         args.dataset,
         f"{pair_meta['pair_tag']}_{args.method}_{args.regression_imitation_loss}_seed{args.seed}",
     )
+    model_param_count = count_parameters(model)
+    correction_gate_param_count = count_parameters(correction_gate) if correction_gate is not None else 0
     print(f"[time_series] run_dir={run_dir}")
-    print(f"[time_series] params={count_parameters(model)}")
+    print(f"[time_series] params={model_param_count + correction_gate_param_count}")
+    if correction_gate is not None:
+        print(f"[time_series] correction_gate_params={correction_gate_param_count}")
 
     epoch_log_path = Path(run_dir) / "epoch_metrics.jsonl"
     if epoch_log_path.exists():
@@ -1410,6 +2059,12 @@ def main():
     best_val_before_activation_epoch = None
     best_val_after_activation = float("inf")
     best_val_after_activation_epoch = None
+    early_stop_enabled = args.early_stop_patience > 0
+    early_stop_bad_epochs = 0
+    early_stop_min_epochs = max(args.early_stop_min_epochs, 0)
+    stopped_early = False
+    stop_epoch = None
+    stop_reason = None
     last_train_stats = {
         "train_total": 0.0,
         "supervised_loss_mean": 0.0,
@@ -1447,6 +2102,7 @@ def main():
         "anchor_loss_mean": 0.0,
         "conflict_cosine": 0.0,
         "conflict_projection_applied_ratio": 0.0,
+        "correction_focus_ratio": 1.0,
     }
     hetero_ssml_one_way = args.hetero_ssml_one_way and pair_meta["is_heterogeneous_pair"]
 
@@ -1468,12 +2124,25 @@ def main():
             decay_end_epoch=args.imitation_decay_end_epoch,
             decay_min_scale=args.imitation_decay_min_scale,
         )
+        correction_apply_scale = (
+            compute_correction_ramp_scale(
+                epoch=epoch,
+                start_epoch=args.ssml_correction_ramp_start_epoch,
+                end_epoch=args.ssml_correction_ramp_end_epoch,
+            )
+            if corrective_mode
+            else 1.0
+        )
+        correction_freeze_student = (
+            corrective_mode and epoch <= max(args.ssml_correction_freeze_student_epochs, 0)
+        )
 
         train_stats = train_one_epoch(
             model,
             peer_model,
             ema_model,
             ema_peer_model,
+            correction_gate,
             train_loader,
             optimizer,
             peer_optimizer,
@@ -1507,7 +2176,24 @@ def main():
             ssml_residual_space_kernel=args.ssml_residual_space_kernel,
             ssml_conflict_aware_projection=args.ssml_conflict_aware_projection,
             ssml_guidance_mode=args.ssml_guidance_mode,
+            ssml_correction_sparsity_weight=args.ssml_correction_sparsity_weight,
+            ssml_correction_threshold=args.ssml_correction_threshold,
+            ssml_correction_only=args.ssml_correction_only,
+            ssml_correction_tail_start_ratio=args.ssml_correction_tail_start_ratio,
+            ssml_correction_regime_focus_quantile=args.ssml_correction_regime_focus_quantile,
+            ssml_correction_focus_loss_alpha=args.ssml_correction_focus_loss_alpha,
+            ssml_correction_peer_advantage_quantile=args.ssml_correction_peer_advantage_quantile,
+            ssml_correction_peer_advantage_min=args.ssml_correction_peer_advantage_min,
+            ssml_correction_peer_advantage_smoothing_kernel=args.ssml_correction_peer_advantage_smoothing_kernel,
+            ssml_correction_budget_ratio=args.ssml_correction_budget_ratio,
+            ssml_correction_feature_mode=args.ssml_correction_feature_mode,
+            ssml_correction_use_regime_features=args.ssml_correction_use_regime_features,
+            ssml_correction_decomposition_kernel=args.ssml_correction_decomposition_kernel,
+            ssml_correction_trend_scale=args.ssml_correction_trend_scale,
+            ssml_correction_residual_scale=args.ssml_correction_residual_scale,
             guidance_scale=guidance_scale,
+            correction_apply_scale=correction_apply_scale,
+            correction_freeze_student=correction_freeze_student,
             method=args.method,
             hetero_ssml_one_way=hetero_ssml_one_way,
             ssml_student_only=ssml_student_only,
@@ -1517,7 +2203,26 @@ def main():
             anchor_params=anchor_params,
         )
         last_train_stats = train_stats
-        va_mse, va_mae = evaluate(model, val_loader, device)
+        va_mse, va_mae = evaluate(
+            model,
+            val_loader,
+            device,
+            peer_model=peer_model if corrective_mode else None,
+            correction_gate=correction_gate if corrective_mode else None,
+            guidance_scale=guidance_scale,
+            correction_apply_scale=correction_apply_scale,
+            correction_tail_start_ratio=args.ssml_correction_tail_start_ratio,
+            correction_regime_focus_quantile=args.ssml_correction_regime_focus_quantile,
+            correction_peer_advantage_quantile=args.ssml_correction_peer_advantage_quantile,
+            correction_peer_advantage_min=args.ssml_correction_peer_advantage_min,
+            correction_peer_advantage_smoothing_kernel=args.ssml_correction_peer_advantage_smoothing_kernel,
+            correction_budget_ratio=args.ssml_correction_budget_ratio,
+            correction_feature_mode=args.ssml_correction_feature_mode,
+            correction_use_regime_features=args.ssml_correction_use_regime_features,
+            correction_decomposition_kernel=args.ssml_correction_decomposition_kernel,
+            correction_trend_scale=args.ssml_correction_trend_scale,
+            correction_residual_scale=args.ssml_correction_residual_scale,
+        )
         peer_va_mse = None
         peer_va_mae = None
         if peer_model is not None:
@@ -1530,10 +2235,16 @@ def main():
         train_active_ratio_curve.append(train_stats["active_imitation_ratio"])
         val_mse_curve.append(va_mse)
         val_mae_curve.append(va_mae)
-        if va_mse < best_val_mse:
+        improved = va_mse < (best_val_mse - args.early_stop_min_delta)
+        if improved:
             best_val_mse = va_mse
             best_epoch = epoch
+            early_stop_bad_epochs = 0
             torch.save(model.state_dict(), run_dir / "best_model.pt")
+            if correction_gate is not None:
+                torch.save(correction_gate.state_dict(), run_dir / "best_correction_gate.pt")
+        elif early_stop_enabled and epoch >= early_stop_min_epochs:
+            early_stop_bad_epochs += 1
         if peer_va_mse is not None and peer_va_mae is not None:
             peer_val_mse_curve.append(peer_va_mse)
             peer_val_mae_curve.append(peer_va_mae)
@@ -1565,6 +2276,9 @@ def main():
             f"[time_series][epoch {epoch:03d}] "
             f"lambda={effective_lambda:.4f} "
             f"g_scale={guidance_scale:.3f} "
+            f"corr_scale={correction_apply_scale:.3f} "
+            f"freeze_student={int(correction_freeze_student)} "
+            f"focus={train_stats['correction_focus_ratio']:.4f} "
             f"train_total={train_stats['train_total']:.8f} "
             f"train_sup={train_stats['supervised_loss_mean']:.8f} "
             f"train_imit={train_stats['imitation_loss_mean']:.8f} "
@@ -1637,7 +2351,26 @@ def main():
                 "ssml_residual_space_kernel": args.ssml_residual_space_kernel,
                 "ssml_conflict_aware_projection": args.ssml_conflict_aware_projection,
                 "ssml_guidance_mode": args.ssml_guidance_mode,
+                "ssml_correction_init_bias": args.ssml_correction_init_bias,
+                "ssml_correction_ramp_start_epoch": args.ssml_correction_ramp_start_epoch,
+                "ssml_correction_ramp_end_epoch": args.ssml_correction_ramp_end_epoch,
+                "ssml_correction_freeze_student_epochs": args.ssml_correction_freeze_student_epochs,
+                "ssml_correction_only": args.ssml_correction_only,
+                "ssml_correction_tail_start_ratio": args.ssml_correction_tail_start_ratio,
+                "ssml_correction_regime_focus_quantile": args.ssml_correction_regime_focus_quantile,
+                "ssml_correction_focus_loss_alpha": args.ssml_correction_focus_loss_alpha,
+                "ssml_correction_peer_advantage_quantile": args.ssml_correction_peer_advantage_quantile,
+                "ssml_correction_peer_advantage_min": args.ssml_correction_peer_advantage_min,
+                "ssml_correction_peer_advantage_smoothing_kernel": args.ssml_correction_peer_advantage_smoothing_kernel,
+                "ssml_correction_budget_ratio": args.ssml_correction_budget_ratio,
+                "ssml_correction_feature_mode": args.ssml_correction_feature_mode,
+                "ssml_correction_use_regime_features": args.ssml_correction_use_regime_features,
+                "ssml_correction_decomposition_kernel": args.ssml_correction_decomposition_kernel,
+                "ssml_correction_trend_scale": args.ssml_correction_trend_scale,
+                "ssml_correction_residual_scale": args.ssml_correction_residual_scale,
                 "guidance_scale": guidance_scale,
+                "correction_apply_scale": correction_apply_scale,
+                "correction_freeze_student": correction_freeze_student,
                 "train_total": train_stats["train_total"],
                 "supervised_loss_mean": train_stats["supervised_loss_mean"],
                 "imitation_loss_mean": train_stats["imitation_loss_mean"],
@@ -1674,6 +2407,7 @@ def main():
                 "anchor_loss_mean": train_stats["anchor_loss_mean"],
                 "conflict_cosine": train_stats["conflict_cosine"],
                 "conflict_projection_applied_ratio": train_stats["conflict_projection_applied_ratio"],
+                "correction_focus_ratio": train_stats["correction_focus_ratio"],
                 "first_active_epoch_so_far": first_active_epoch,
                 "best_val_mse_so_far": best_val_mse,
                 "best_epoch_so_far": best_epoch,
@@ -1688,7 +2422,21 @@ def main():
             },
         )
 
-        if epoch % args.live_plot_interval == 0 or epoch == args.epochs:
+        should_stop = (
+            early_stop_enabled
+            and epoch >= early_stop_min_epochs
+            and early_stop_bad_epochs >= args.early_stop_patience
+        )
+        if should_stop:
+            stopped_early = True
+            stop_epoch = epoch
+            stop_reason = (
+                f"no val_mse improvement greater than {args.early_stop_min_delta:.6g} "
+                f"for {args.early_stop_patience} epoch(s)"
+            )
+            print(f"[time_series][epoch {epoch:03d}] early stop: {stop_reason}")
+
+        if epoch % args.live_plot_interval == 0 or epoch == args.epochs or should_stop:
             save_curves(
                 run_dir / "curves.npz",
                 train_total=train_total_curve,
@@ -1719,6 +2467,8 @@ def main():
                 print(f"[time_series][epoch {epoch:03d}] updated live plot")
             else:
                 print(f"[time_series][epoch {epoch:03d}] live plot skipped")
+        if should_stop:
+            break
     save_curves(
         run_dir / "curves.npz",
         train_total=train_total_curve,
@@ -1765,6 +2515,22 @@ def main():
             f"adaptive_dense_thr={args.ssml_adaptive_dense_threshold:.3f} "
             f"positive_upper_q={args.ssml_positive_upper_quantile:.3f} "
             f"guidance_schedule=warmup_then_decay "
+            f"correction_init_bias={args.ssml_correction_init_bias:.3f} "
+            f"correction_ramp={args.ssml_correction_ramp_start_epoch}->{args.ssml_correction_ramp_end_epoch} "
+            f"correction_freeze_student_epochs={args.ssml_correction_freeze_student_epochs} "
+            f"correction_only={int(args.ssml_correction_only)} "
+            f"correction_tail_start={args.ssml_correction_tail_start_ratio:.2f} "
+            f"correction_regime_q={args.ssml_correction_regime_focus_quantile:.2f} "
+            f"correction_focus_alpha={args.ssml_correction_focus_loss_alpha:.2f} "
+            f"correction_peer_adv_q={args.ssml_correction_peer_advantage_quantile:.2f} "
+            f"correction_peer_adv_min={args.ssml_correction_peer_advantage_min:.4f} "
+            f"correction_peer_adv_k={args.ssml_correction_peer_advantage_smoothing_kernel} "
+            f"correction_budget_ratio={args.ssml_correction_budget_ratio:.3f} "
+            f"correction_feature_mode={args.ssml_correction_feature_mode} "
+            f"correction_regime={int(args.ssml_correction_use_regime_features)} "
+            f"correction_decomp_k={args.ssml_correction_decomposition_kernel} "
+            f"correction_trend_scale={args.ssml_correction_trend_scale:.3f} "
+            f"correction_residual_scale={args.ssml_correction_residual_scale:.3f} "
             f"first_active_epoch={first_active_epoch} "
             f"best_before_active={before_text} "
             f"best_after_active={after_text}"
@@ -1814,6 +2580,7 @@ def main():
         "anchor_loss_mean": last_train_stats["anchor_loss_mean"],
         "conflict_cosine": last_train_stats["conflict_cosine"],
         "conflict_projection_applied_ratio": last_train_stats["conflict_projection_applied_ratio"],
+        "correction_focus_ratio": last_train_stats["correction_focus_ratio"],
         "curve_mode": "pair" if peer_model is not None else "single",
         "model_idx": 1,
         "model1": args.model,
@@ -1822,6 +2589,13 @@ def main():
         "lambda_imitation": args.lambda_imitation,
         "margin": args.margin,
         "warmup_epochs": args.warmup_epochs,
+        "early_stop_patience": args.early_stop_patience,
+        "early_stop_min_epochs": args.early_stop_min_epochs,
+        "early_stop_min_delta": args.early_stop_min_delta,
+        "epochs_completed": len(val_mse_curve),
+        "stopped_early": stopped_early,
+        "stop_epoch": stop_epoch,
+        "stop_reason": stop_reason,
         "imitation_decay_start_epoch": args.imitation_decay_start_epoch,
         "imitation_decay_end_epoch": args.imitation_decay_end_epoch,
         "imitation_decay_min_scale": args.imitation_decay_min_scale,
@@ -1859,6 +2633,27 @@ def main():
         "ssml_residual_space_kernel": args.ssml_residual_space_kernel,
         "ssml_conflict_aware_projection": args.ssml_conflict_aware_projection,
         "ssml_guidance_mode": args.ssml_guidance_mode,
+        "ssml_correction_gate_hidden_dim": args.ssml_correction_gate_hidden_dim,
+        "ssml_correction_gate_dropout": args.ssml_correction_gate_dropout,
+        "ssml_correction_init_bias": args.ssml_correction_init_bias,
+        "ssml_correction_sparsity_weight": args.ssml_correction_sparsity_weight,
+        "ssml_correction_threshold": args.ssml_correction_threshold,
+        "ssml_correction_ramp_start_epoch": args.ssml_correction_ramp_start_epoch,
+        "ssml_correction_ramp_end_epoch": args.ssml_correction_ramp_end_epoch,
+        "ssml_correction_freeze_student_epochs": args.ssml_correction_freeze_student_epochs,
+        "ssml_correction_only": args.ssml_correction_only,
+        "ssml_correction_tail_start_ratio": args.ssml_correction_tail_start_ratio,
+        "ssml_correction_regime_focus_quantile": args.ssml_correction_regime_focus_quantile,
+        "ssml_correction_focus_loss_alpha": args.ssml_correction_focus_loss_alpha,
+        "ssml_correction_peer_advantage_quantile": args.ssml_correction_peer_advantage_quantile,
+        "ssml_correction_peer_advantage_min": args.ssml_correction_peer_advantage_min,
+        "ssml_correction_peer_advantage_smoothing_kernel": args.ssml_correction_peer_advantage_smoothing_kernel,
+        "ssml_correction_budget_ratio": args.ssml_correction_budget_ratio,
+        "ssml_correction_feature_mode": args.ssml_correction_feature_mode,
+        "ssml_correction_use_regime_features": args.ssml_correction_use_regime_features,
+        "ssml_correction_decomposition_kernel": args.ssml_correction_decomposition_kernel,
+        "ssml_correction_trend_scale": args.ssml_correction_trend_scale,
+        "ssml_correction_residual_scale": args.ssml_correction_residual_scale,
         "ssml_gate_rule": f"{args.ssml_gate_score_mode}_windowwise_topk",
         "ssml_supervised_rule": (
             "binary_hotspot_reweighting"
@@ -1866,6 +2661,11 @@ def main():
             else "score_weighted_hotspot_reweighting"
         ),
         "ssml_directionality": (
+            "frozen_backbone_sparse_correction_gate"
+            if correction_only
+            else "primary_model_with_frozen_teacher_correction_gate"
+            if corrective_mode
+            else
             "primary_model_only_frozen_peer"
             if peer_update_disabled
             else "bidirectional_hotspot_focus"
@@ -1883,6 +2683,8 @@ def main():
         "best_epoch": best_epoch,
         "first_active_epoch": first_active_epoch,
         "best_model_path": str(run_dir / "best_model.pt"),
+        "best_correction_gate_path": str(run_dir / "best_correction_gate.pt") if correction_gate is not None else None,
+        "correction_gate_path": str(run_dir / "correction_gate.pt") if correction_gate is not None else None,
         "best_val_mse_before_activation": None if math.isinf(best_val_before_activation) else best_val_before_activation,
         "best_val_mse_before_activation_epoch": best_val_before_activation_epoch,
         "best_val_mse_after_activation": None if math.isinf(best_val_after_activation) else best_val_after_activation,
@@ -1898,8 +2700,9 @@ def main():
         "final_val_mse1": val_mse_curve[-1],
         "final_val_mae1": val_mae_curve[-1],
         "final_val1": val_mse_curve[-1],
-        "num_parameters": count_parameters(model),
-        "num_parameters1": count_parameters(model),
+        "num_parameters": model_param_count + correction_gate_param_count,
+        "num_parameters1": model_param_count + correction_gate_param_count,
+        "num_parameters_correction_gate": correction_gate_param_count,
         "meta": meta,
     }
     if peer_model is not None:
@@ -1920,6 +2723,8 @@ def main():
     torch.save(model.state_dict(), run_dir / "model.pt")
     if peer_model is not None:
         torch.save(peer_model.state_dict(), run_dir / "peer_model.pt")
+    if correction_gate is not None:
+        torch.save(correction_gate.state_dict(), run_dir / "correction_gate.pt")
     print("[time_series] done")
 
 

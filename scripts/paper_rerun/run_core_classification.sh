@@ -24,6 +24,7 @@ WARMUP_EPOCHS="${WARMUP_EPOCHS:-0}"
 IMITATION_DECAY_START_EPOCH="${IMITATION_DECAY_START_EPOCH:--1}"
 IMITATION_DECAY_END_EPOCH="${IMITATION_DECAY_END_EPOCH:--1}"
 IMITATION_DECAY_MIN_SCALE="${IMITATION_DECAY_MIN_SCALE:-1.0}"
+FREEZE_BN_STATS="${FREEZE_BN_STATS:-0}"
 HETERO_SSML_ONE_WAY="${HETERO_SSML_ONE_WAY:-0}"
 SSML_STUDENT_ONLY="${SSML_STUDENT_ONLY:-0}"
 SSML_FREEZE_PEER="${SSML_FREEZE_PEER:-0}"
@@ -46,6 +47,13 @@ LABEL_NOISE_CONDITIONS="${LABEL_NOISE_CONDITIONS:-none:0.0}"
 SSML_DISAGREEMENT_ONLY="${SSML_DISAGREEMENT_ONLY:-0}"
 SSML_CLASS_BALANCED_TOPK="${SSML_CLASS_BALANCED_TOPK:-0}"
 SSML_PER_CLASS_BUDGET="${SSML_PER_CLASS_BUDGET:-0}"
+SSML_AUG_CONSISTENCY_WEIGHT="${SSML_AUG_CONSISTENCY_WEIGHT:-0.0}"
+SSML_AUG_CONSISTENCY_SHIFT="${SSML_AUG_CONSISTENCY_SHIFT:-0}"
+SSML_AUG_CONSISTENCY_FLIP_PROB="${SSML_AUG_CONSISTENCY_FLIP_PROB:-0.0}"
+SSML_AUG_CONSISTENCY_NOISE_STD="${SSML_AUG_CONSISTENCY_NOISE_STD:-0.0}"
+SSML_PEER_AUG_CONSISTENCY_MIN="${SSML_PEER_AUG_CONSISTENCY_MIN:-0.0}"
+SSML_STUDENT_AUG_CONSISTENCY_MAX="${SSML_STUDENT_AUG_CONSISTENCY_MAX:-1.0}"
+SSML_PEER_STUDENT_AUG_CONSISTENCY_GAP_MIN="${SSML_PEER_STUDENT_AUG_CONSISTENCY_GAP_MIN:-0.0}"
 INIT_CHECKPOINT_TEMPLATE="${INIT_CHECKPOINT_TEMPLATE:-}"
 PEER_INIT_CHECKPOINT_TEMPLATE="${PEER_INIT_CHECKPOINT_TEMPLATE:-}"
 
@@ -69,7 +77,10 @@ render_checkpoint_template() {
 echo "[classification] output_dir=$OUTPUT_DIR"
 echo "[classification] methods=$METHODS"
 echo "[classification] model_pairs=$MODEL_PAIRS"
+echo "[classification] device_request=$DEVICE"
+echo "[classification] cuda_visible_devices=${CUDA_VISIBLE_DEVICES:-<unset>}"
 echo "[classification] distill_temperature=$DISTILL_TEMPERATURE"
+echo "[classification] freeze_bn_stats=$FREEZE_BN_STATS"
 echo "[classification] ssml_topk_ratio=$SSML_TOPK_RATIO"
 echo "[classification] ssml_topk_scope=$SSML_TOPK_SCOPE"
 echo "[classification] ssml_supervised_hotspot_alpha=$SSML_SUPERVISED_HOTSPOT_ALPHA"
@@ -85,6 +96,13 @@ echo "[classification] ssml_class_balanced_topk=$SSML_CLASS_BALANCED_TOPK"
 echo "[classification] ssml_per_class_budget=$SSML_PER_CLASS_BUDGET"
 echo "[classification] ssml_peer_true_prob_threshold=$SSML_PEER_TRUE_PROB_THRESHOLD"
 echo "[classification] ssml_peer_student_prob_gap_min=$SSML_PEER_STUDENT_PROB_GAP_MIN"
+echo "[classification] ssml_aug_consistency_weight=$SSML_AUG_CONSISTENCY_WEIGHT"
+echo "[classification] ssml_aug_consistency_shift=$SSML_AUG_CONSISTENCY_SHIFT"
+echo "[classification] ssml_aug_consistency_flip_prob=$SSML_AUG_CONSISTENCY_FLIP_PROB"
+echo "[classification] ssml_aug_consistency_noise_std=$SSML_AUG_CONSISTENCY_NOISE_STD"
+echo "[classification] ssml_peer_aug_consistency_min=$SSML_PEER_AUG_CONSISTENCY_MIN"
+echo "[classification] ssml_student_aug_consistency_max=$SSML_STUDENT_AUG_CONSISTENCY_MAX"
+echo "[classification] ssml_peer_student_aug_consistency_gap_min=$SSML_PEER_STUDENT_AUG_CONSISTENCY_GAP_MIN"
 echo "[classification] ssml_freeze_peer=$SSML_FREEZE_PEER"
 echo "[classification] ssml_worse_only_update=$SSML_WORSE_ONLY_UPDATE"
 echo "[classification] ssml_anchor_weight=$SSML_ANCHOR_WEIGHT"
@@ -129,6 +147,13 @@ for dataset in $DATASETS; do
               --ssml-peer-true-prob-threshold "$SSML_PEER_TRUE_PROB_THRESHOLD"
               --ssml-peer-student-prob-gap-min "$SSML_PEER_STUDENT_PROB_GAP_MIN"
               --ssml-student-true-prob-max "$SSML_STUDENT_TRUE_PROB_MAX"
+              --ssml-aug-consistency-weight "$SSML_AUG_CONSISTENCY_WEIGHT"
+              --ssml-aug-consistency-shift "$SSML_AUG_CONSISTENCY_SHIFT"
+              --ssml-aug-consistency-flip-prob "$SSML_AUG_CONSISTENCY_FLIP_PROB"
+              --ssml-aug-consistency-noise-std "$SSML_AUG_CONSISTENCY_NOISE_STD"
+              --ssml-peer-aug-consistency-min "$SSML_PEER_AUG_CONSISTENCY_MIN"
+              --ssml-student-aug-consistency-max "$SSML_STUDENT_AUG_CONSISTENCY_MAX"
+              --ssml-peer-student-aug-consistency-gap-min "$SSML_PEER_STUDENT_AUG_CONSISTENCY_GAP_MIN"
               --warmup-epochs "$WARMUP_EPOCHS"
               --imitation-decay-start-epoch "$IMITATION_DECAY_START_EPOCH"
               --imitation-decay-end-epoch "$IMITATION_DECAY_END_EPOCH"
@@ -140,6 +165,9 @@ for dataset in $DATASETS; do
             fi
             if [[ "$DOWNLOAD" == "1" ]]; then
               cmd+=(--download)
+            fi
+            if [[ "$FREEZE_BN_STATS" == "1" ]]; then
+              cmd+=(--freeze-bn-stats)
             fi
             if [[ "$HETERO_SSML_ONE_WAY" == "1" ]]; then
               cmd+=(--hetero-ssml-one-way)
@@ -214,6 +242,13 @@ for dataset in $DATASETS; do
             --ssml-peer-true-prob-threshold "$SSML_PEER_TRUE_PROB_THRESHOLD"
             --ssml-peer-student-prob-gap-min "$SSML_PEER_STUDENT_PROB_GAP_MIN"
             --ssml-student-true-prob-max "$SSML_STUDENT_TRUE_PROB_MAX"
+            --ssml-aug-consistency-weight "$SSML_AUG_CONSISTENCY_WEIGHT"
+            --ssml-aug-consistency-shift "$SSML_AUG_CONSISTENCY_SHIFT"
+            --ssml-aug-consistency-flip-prob "$SSML_AUG_CONSISTENCY_FLIP_PROB"
+            --ssml-aug-consistency-noise-std "$SSML_AUG_CONSISTENCY_NOISE_STD"
+            --ssml-peer-aug-consistency-min "$SSML_PEER_AUG_CONSISTENCY_MIN"
+            --ssml-student-aug-consistency-max "$SSML_STUDENT_AUG_CONSISTENCY_MAX"
+            --ssml-peer-student-aug-consistency-gap-min "$SSML_PEER_STUDENT_AUG_CONSISTENCY_GAP_MIN"
             --warmup-epochs "$WARMUP_EPOCHS"
             --imitation-decay-start-epoch "$IMITATION_DECAY_START_EPOCH"
             --imitation-decay-end-epoch "$IMITATION_DECAY_END_EPOCH"
@@ -225,6 +260,9 @@ for dataset in $DATASETS; do
           fi
           if [[ "$DOWNLOAD" == "1" ]]; then
             cmd+=(--download)
+          fi
+          if [[ "$FREEZE_BN_STATS" == "1" ]]; then
+            cmd+=(--freeze-bn-stats)
           fi
           if [[ "$HETERO_SSML_ONE_WAY" == "1" ]]; then
             cmd+=(--hetero-ssml-one-way)

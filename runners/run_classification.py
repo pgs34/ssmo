@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 import math
+import os
+import socket
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -37,6 +39,44 @@ CLASSIFICATION_MODEL_CHOICES = [
 CLASSIFICATION_METHOD_CHOICES = ["independent", "dml", "ssml"]
 
 
+def apply_batchnorm_eval(module: torch.nn.Module) -> None:
+    for submodule in module.modules():
+        if isinstance(submodule, torch.nn.modules.batchnorm._BatchNorm):
+            submodule.eval()
+
+
+def log_runtime_environment(args, device: torch.device) -> None:
+    cuda_available = torch.cuda.is_available()
+    cuda_device_count = torch.cuda.device_count() if cuda_available else 0
+    cuda_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES", "<unset>")
+    fallback_reason = "requested_device_available"
+    if args.device.startswith("cuda") and not cuda_available:
+        fallback_reason = "cuda_unavailable_fallback_to_cpu"
+    elif device.type == "cpu":
+        fallback_reason = "cpu_requested"
+
+    print(
+        "[classification][runtime] "
+        f"pid={os.getpid()} "
+        f"ppid={os.getppid()} "
+        f"host={socket.gethostname()} "
+        f"cwd={Path.cwd()} "
+        f"requested_device={args.device} "
+        f"resolved_device={device} "
+        f"cuda_available={int(cuda_available)} "
+        f"cuda_device_count={cuda_device_count} "
+        f"cuda_visible_devices={cuda_visible_devices} "
+        f"fallback_reason={fallback_reason}"
+    )
+    if cuda_available and device.type == "cuda":
+        current_index = device.index if device.index is not None else torch.cuda.current_device()
+        print(
+            "[classification][runtime] "
+            f"cuda_current_device={current_index} "
+            f"cuda_device_name={torch.cuda.get_device_name(current_index)}"
+        )
+
+
 def parse_args():
     p = argparse.ArgumentParser(description="Run classification experiment")
     p.add_argument("--dataset", type=str, default="cifar10", choices=["mnist", "cifar10", "cifar100"])
@@ -69,6 +109,7 @@ def parse_args():
     p.add_argument("--imitation-decay-start-epoch", type=int, default=-1)
     p.add_argument("--imitation-decay-end-epoch", type=int, default=-1)
     p.add_argument("--imitation-decay-min-scale", type=float, default=1.0)
+    p.add_argument("--freeze-bn-stats", action="store_true")
     p.add_argument("--hetero-ssml-one-way", action="store_true")
     p.add_argument("--ssml-student-only", action="store_true")
     p.add_argument("--ssml-freeze-peer", action="store_true")
@@ -92,6 +133,7 @@ def parse_args():
             "peer_better_student_error",
             "peer_better_true_prob_gap",
             "peer_better_true_prob_gap_weighted",
+            "peer_confident_student_uncertain",
             "useful_hard_sample",
             "useful_hard_sample_confident",
         ],
@@ -116,6 +158,13 @@ def parse_args():
     p.add_argument("--ssml-per-class-budget", type=int, default=0)
     p.add_argument("--ssml-peer-true-prob-threshold", type=float, default=0.0)
     p.add_argument("--ssml-peer-student-prob-gap-min", type=float, default=0.0)
+    p.add_argument("--ssml-aug-consistency-weight", type=float, default=0.0)
+    p.add_argument("--ssml-aug-consistency-shift", type=int, default=0)
+    p.add_argument("--ssml-aug-consistency-flip-prob", type=float, default=0.0)
+    p.add_argument("--ssml-aug-consistency-noise-std", type=float, default=0.0)
+    p.add_argument("--ssml-peer-aug-consistency-min", type=float, default=0.0)
+    p.add_argument("--ssml-student-aug-consistency-max", type=float, default=1.0)
+    p.add_argument("--ssml-peer-student-aug-consistency-gap-min", type=float, default=0.0)
     p.add_argument("--init-checkpoint", type=str, default=None)
     p.add_argument("--peer-init-checkpoint", type=str, default=None)
     p.add_argument("--live-plot-interval", type=int, default=20)
@@ -125,6 +174,122 @@ def parse_args():
 def accuracy(logits: torch.Tensor, targets: torch.Tensor) -> float:
     preds = logits.argmax(dim=1)
     return float((preds == targets).float().mean().item())
+
+
+def compute_probability_margin(probabilities: torch.Tensor) -> torch.Tensor:
+    if probabilities.ndim != 2:
+        raise ValueError(f"Expected class probabilities with shape [B, C], got: {tuple(probabilities.shape)}")
+    if probabilities.shape[1] <= 1:
+        return torch.ones(probabilities.shape[0], device=probabilities.device, dtype=probabilities.dtype)
+    top2 = torch.topk(probabilities, k=2, dim=1).values
+    return torch.clamp(top2[:, 0] - top2[:, 1], min=0.0, max=1.0)
+
+
+def compute_normalized_entropy(probabilities: torch.Tensor) -> torch.Tensor:
+    if probabilities.ndim != 2:
+        raise ValueError(f"Expected class probabilities with shape [B, C], got: {tuple(probabilities.shape)}")
+    num_classes = probabilities.shape[1]
+    if num_classes <= 1:
+        return torch.zeros(probabilities.shape[0], device=probabilities.device, dtype=probabilities.dtype)
+    entropy = -(probabilities * torch.log(torch.clamp(probabilities, min=1e-8, max=1.0))).sum(dim=1)
+    return torch.clamp(entropy / math.log(num_classes), min=0.0, max=1.0)
+
+
+def apply_batch_consistency_augmentation(
+    images: torch.Tensor,
+    *,
+    max_shift: int,
+    flip_prob: float,
+    noise_std: float,
+) -> torch.Tensor:
+    if images.ndim != 4:
+        raise ValueError(f"Expected images with shape [B, C, H, W], got: {tuple(images.shape)}")
+    augmented = images.clone()
+    batch_size = int(images.shape[0])
+    if max_shift > 0:
+        shifts_y = torch.randint(-max_shift, max_shift + 1, (batch_size,), device=images.device)
+        shifts_x = torch.randint(-max_shift, max_shift + 1, (batch_size,), device=images.device)
+        for idx in range(batch_size):
+            shift_y = int(shifts_y[idx].item())
+            shift_x = int(shifts_x[idx].item())
+            if shift_y != 0 or shift_x != 0:
+                augmented[idx] = torch.roll(
+                    augmented[idx],
+                    shifts=(shift_y, shift_x),
+                    dims=(-2, -1),
+                )
+    if flip_prob > 0.0 and augmented.shape[1] > 1:
+        flip_mask = torch.rand(batch_size, device=images.device) < flip_prob
+        if bool(flip_mask.any().item()):
+            augmented[flip_mask] = torch.flip(augmented[flip_mask], dims=(-1,))
+    if noise_std > 0.0:
+        augmented = augmented + torch.randn_like(augmented) * noise_std
+    return augmented
+
+
+def compute_probability_consistency(
+    reference_probabilities: torch.Tensor,
+    augmented_probabilities: torch.Tensor,
+) -> torch.Tensor:
+    if reference_probabilities.shape != augmented_probabilities.shape:
+        raise ValueError(
+            "Probability tensors for consistency must share the same shape, "
+            f"got {tuple(reference_probabilities.shape)} and {tuple(augmented_probabilities.shape)}"
+        )
+    total_variation = 0.5 * torch.abs(reference_probabilities - augmented_probabilities).sum(dim=1)
+    return torch.clamp(1.0 - total_variation, min=0.0, max=1.0)
+
+
+def compute_augmented_consistency_scores(
+    model: torch.nn.Module,
+    peer_model: torch.nn.Module,
+    x: torch.Tensor,
+    student_prob_dist: torch.Tensor,
+    peer_prob_dist: torch.Tensor,
+    *,
+    max_shift: int,
+    flip_prob: float,
+    noise_std: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    augmented_x = apply_batch_consistency_augmentation(
+        x,
+        max_shift=max_shift,
+        flip_prob=flip_prob,
+        noise_std=noise_std,
+    )
+    student_was_training = model.training
+    peer_was_training = peer_model.training
+    model.eval()
+    peer_model.eval()
+    with torch.no_grad():
+        student_aug_prob = F.softmax(model(augmented_x), dim=1)
+        peer_aug_prob = F.softmax(peer_model(augmented_x), dim=1)
+    if student_was_training:
+        model.train()
+    else:
+        model.eval()
+    if peer_was_training:
+        peer_model.train()
+    else:
+        peer_model.eval()
+    return (
+        compute_probability_consistency(student_prob_dist, student_aug_prob),
+        compute_probability_consistency(peer_prob_dist, peer_aug_prob),
+    )
+
+
+def build_aug_consistency_reweight(
+    student_consistency: torch.Tensor,
+    peer_consistency: torch.Tensor,
+    *,
+    weight: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if weight <= 0.0:
+        ones = torch.ones_like(student_consistency)
+        return ones, ones
+    student_signal = torch.clamp(peer_consistency - 0.5 * student_consistency, min=0.0, max=1.0)
+    peer_signal = torch.clamp(student_consistency - 0.5 * peer_consistency, min=0.0, max=1.0)
+    return 1.0 + weight * student_signal, 1.0 + weight * peer_signal
 
 
 def build_imitation_loss_fn(imitation_loss_name: str) -> Callable[[torch.Tensor, torch.Tensor], torch.Tensor]:
@@ -418,6 +583,8 @@ def compute_ssml_sample_scores(
     score_transform: str,
     student_true_prob: Optional[torch.Tensor] = None,
     peer_true_prob: Optional[torch.Tensor] = None,
+    student_prob_dist: Optional[torch.Tensor] = None,
+    peer_prob_dist: Optional[torch.Tensor] = None,
     student_correct: Optional[torch.Tensor] = None,
     peer_correct: Optional[torch.Tensor] = None,
     prediction_disagreement: Optional[torch.Tensor] = None,
@@ -468,6 +635,41 @@ def compute_ssml_sample_scores(
         peer_advantage = torch.clamp(student_true_prob - peer_true_prob - margin, min=0.0)
         student_scores = student_hardness * student_advantage
         peer_scores = peer_hardness * peer_advantage
+        return student_scores, peer_scores
+
+    if score_mode == "peer_confident_student_uncertain":
+        if (
+            student_true_prob is None
+            or peer_true_prob is None
+            or student_prob_dist is None
+            or peer_prob_dist is None
+        ):
+            raise ValueError(
+                "student_true_prob, peer_true_prob, student_prob_dist, and peer_prob_dist "
+                "are required for peer_confident_student_uncertain"
+            )
+        student_hardness = transform_ssml_score_signal(1.0 - student_true_prob, score_transform)
+        peer_hardness = transform_ssml_score_signal(1.0 - peer_true_prob, score_transform)
+        student_uncertainty = compute_normalized_entropy(student_prob_dist)
+        peer_uncertainty = compute_normalized_entropy(peer_prob_dist)
+        student_clarity = compute_probability_margin(student_prob_dist)
+        peer_clarity = compute_probability_margin(peer_prob_dist)
+        student_advantage = torch.clamp(peer_true_prob - student_true_prob - margin, min=0.0)
+        peer_advantage = torch.clamp(student_true_prob - peer_true_prob - margin, min=0.0)
+        student_scores = (
+            student_hardness
+            * student_advantage
+            * (1.0 + student_uncertainty)
+            * peer_clarity
+            * (1.0 - peer_uncertainty)
+        )
+        peer_scores = (
+            peer_hardness
+            * peer_advantage
+            * (1.0 + peer_uncertainty)
+            * student_clarity
+            * (1.0 - student_uncertainty)
+        )
         return student_scores, peer_scores
 
     if score_mode == "useful_hard_sample":
@@ -627,8 +829,16 @@ def train_one_epoch(
     ssml_peer_true_prob_threshold: float,
     ssml_peer_student_prob_gap_min: float,
     ssml_student_true_prob_max: float,
+    ssml_aug_consistency_weight: float,
+    ssml_aug_consistency_shift: int,
+    ssml_aug_consistency_flip_prob: float,
+    ssml_aug_consistency_noise_std: float,
+    ssml_peer_aug_consistency_min: float,
+    ssml_student_aug_consistency_max: float,
+    ssml_peer_student_aug_consistency_gap_min: float,
     guidance_scale: float,
     method: str,
+    freeze_bn_stats: bool = False,
     hetero_ssml_one_way: bool = False,
     ssml_student_only: bool = False,
     ssml_freeze_peer: bool = False,
@@ -639,11 +849,15 @@ def train_one_epoch(
     method = canonicalize_method_name(method)
     peer_update_disabled = ssml_student_only or ssml_freeze_peer
     model.train()
+    if freeze_bn_stats:
+        apply_batchnorm_eval(model)
     if peer_model is not None:
         if method == "ssml" and peer_update_disabled:
             peer_model.eval()
         else:
             peer_model.train()
+            if freeze_bn_stats:
+                apply_batchnorm_eval(peer_model)
     dml_weight_builder = get_directional_weight_builder("dml")
     total_loss = 0.0
     total_acc = 0.0
@@ -682,6 +896,8 @@ def train_one_epoch(
     total_peer_update_ratio = 0.0
     total_student_selected_per_class = 0.0
     total_peer_selected_per_class = 0.0
+    total_student_aug_consistency_mean = 0.0
+    total_peer_aug_consistency_mean = 0.0
     total_anchor_loss = 0.0
     total_count = 0
     for x, y in loader:
@@ -728,6 +944,8 @@ def train_one_epoch(
         peer_update_ratio = 0.0
         student_selected_per_class = 0.0
         peer_selected_per_class = 0.0
+        student_aug_consistency_mean = 0.0
+        peer_aug_consistency_mean = 0.0
         anchor_loss_metric = 0.0
 
         if method == "independent":
@@ -784,6 +1002,14 @@ def train_one_epoch(
             prediction_disagreement = student_pred.ne(peer_pred)
             student_true_prob = student_probs.gather(1, y.unsqueeze(1)).squeeze(1)
             peer_true_prob = peer_probs.gather(1, y.unsqueeze(1)).squeeze(1)
+            aug_consistency_enabled = (
+                ssml_aug_consistency_weight > 0.0
+                and (
+                    ssml_aug_consistency_shift > 0
+                    or ssml_aug_consistency_flip_prob > 0.0
+                    or ssml_aug_consistency_noise_std > 0.0
+                )
+            )
             student_scores, peer_scores = compute_ssml_sample_scores(
                 student_sample_loss,
                 peer_sample_loss,
@@ -792,10 +1018,58 @@ def train_one_epoch(
                 score_transform=ssml_score_transform,
                 student_true_prob=student_true_prob,
                 peer_true_prob=peer_true_prob,
+                student_prob_dist=student_probs,
+                peer_prob_dist=peer_probs,
                 student_correct=student_correct,
                 peer_correct=peer_correct,
                 prediction_disagreement=prediction_disagreement,
             )
+            if aug_consistency_enabled:
+                student_aug_consistency, peer_aug_consistency = compute_augmented_consistency_scores(
+                    model,
+                    peer_model,
+                    x,
+                    student_probs,
+                    peer_probs,
+                    max_shift=ssml_aug_consistency_shift,
+                    flip_prob=ssml_aug_consistency_flip_prob,
+                    noise_std=ssml_aug_consistency_noise_std,
+                )
+                if freeze_bn_stats:
+                    apply_batchnorm_eval(model)
+                    apply_batchnorm_eval(peer_model)
+                student_consistency_factor, peer_consistency_factor = build_aug_consistency_reweight(
+                    student_aug_consistency,
+                    peer_aug_consistency,
+                    weight=ssml_aug_consistency_weight,
+                )
+                student_scores = student_scores * student_consistency_factor
+                peer_scores = peer_scores * peer_consistency_factor
+                student_aug_consistency_mean = float(student_aug_consistency.mean().item())
+                peer_aug_consistency_mean = float(peer_aug_consistency.mean().item())
+                if ssml_peer_aug_consistency_min > 0.0:
+                    student_scores = student_scores * (
+                        peer_aug_consistency >= ssml_peer_aug_consistency_min
+                    ).to(dtype=student_scores.dtype)
+                    peer_scores = peer_scores * (
+                        student_aug_consistency >= ssml_peer_aug_consistency_min
+                    ).to(dtype=peer_scores.dtype)
+                if ssml_student_aug_consistency_max < 1.0:
+                    student_scores = student_scores * (
+                        student_aug_consistency <= ssml_student_aug_consistency_max
+                    ).to(dtype=student_scores.dtype)
+                    peer_scores = peer_scores * (
+                        peer_aug_consistency <= ssml_student_aug_consistency_max
+                    ).to(dtype=peer_scores.dtype)
+                if ssml_peer_student_aug_consistency_gap_min > 0.0:
+                    student_scores = student_scores * (
+                        (peer_aug_consistency - student_aug_consistency)
+                        >= ssml_peer_student_aug_consistency_gap_min
+                    ).to(dtype=student_scores.dtype)
+                    peer_scores = peer_scores * (
+                        (student_aug_consistency - peer_aug_consistency)
+                        >= ssml_peer_student_aug_consistency_gap_min
+                    ).to(dtype=peer_scores.dtype)
             student_useful_hard = (~student_correct) & peer_correct & prediction_disagreement
             peer_useful_hard = (~peer_correct) & student_correct & prediction_disagreement
             student_teacher_usable = peer_correct.clone()
@@ -1011,6 +1285,8 @@ def train_one_epoch(
         total_peer_update_ratio += peer_update_ratio * batch_size
         total_student_selected_per_class += student_selected_per_class * batch_size
         total_peer_selected_per_class += peer_selected_per_class * batch_size
+        total_student_aug_consistency_mean += student_aug_consistency_mean * batch_size
+        total_peer_aug_consistency_mean += peer_aug_consistency_mean * batch_size
         total_anchor_loss += anchor_loss_metric * batch_size
         total_count += batch_size
     return {
@@ -1051,6 +1327,8 @@ def train_one_epoch(
         "peer_update_ratio": total_peer_update_ratio / total_count,
         "student_selected_per_class": total_student_selected_per_class / total_count,
         "peer_selected_per_class": total_peer_selected_per_class / total_count,
+        "student_aug_consistency_mean": total_student_aug_consistency_mean / total_count,
+        "peer_aug_consistency_mean": total_peer_aug_consistency_mean / total_count,
         "anchor_loss_mean": total_anchor_loss / total_count,
     }
 
@@ -1078,6 +1356,7 @@ def main():
     args.method = canonicalize_method_name(args.method)
     set_seed(args.seed)
     device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+    log_runtime_environment(args, device)
 
     data = build_classification_dataloaders(
         ClassificationDataConfig(
@@ -1206,6 +1485,8 @@ def main():
         "peer_update_ratio": 0.0,
         "student_selected_per_class": 0.0,
         "peer_selected_per_class": 0.0,
+        "student_aug_consistency_mean": 0.0,
+        "peer_aug_consistency_mean": 0.0,
         "anchor_loss_mean": 0.0,
     }
 
@@ -1255,8 +1536,16 @@ def main():
             ssml_peer_true_prob_threshold=args.ssml_peer_true_prob_threshold,
             ssml_peer_student_prob_gap_min=args.ssml_peer_student_prob_gap_min,
             ssml_student_true_prob_max=args.ssml_student_true_prob_max,
+            ssml_aug_consistency_weight=args.ssml_aug_consistency_weight,
+            ssml_aug_consistency_shift=args.ssml_aug_consistency_shift,
+            ssml_aug_consistency_flip_prob=args.ssml_aug_consistency_flip_prob,
+            ssml_aug_consistency_noise_std=args.ssml_aug_consistency_noise_std,
+            ssml_peer_aug_consistency_min=args.ssml_peer_aug_consistency_min,
+            ssml_student_aug_consistency_max=args.ssml_student_aug_consistency_max,
+            ssml_peer_student_aug_consistency_gap_min=args.ssml_peer_student_aug_consistency_gap_min,
             guidance_scale=guidance_scale,
             method=args.method,
+            freeze_bn_stats=args.freeze_bn_stats,
             hetero_ssml_one_way=hetero_ssml_one_way,
             ssml_student_only=ssml_student_only,
             ssml_freeze_peer=ssml_freeze_peer,
@@ -1278,12 +1567,14 @@ def main():
         if va_acc > best_val_acc:
             best_val_acc = va_acc
             best_epoch = epoch
+            torch.save(model.state_dict(), run_dir / "best_model.pt")
         if peer_va_loss is not None and peer_va_acc is not None:
             peer_val_loss_curve.append(peer_va_loss)
             peer_val_acc_curve.append(peer_va_acc)
             if peer_va_acc > best_peer_val_acc:
                 best_peer_val_acc = peer_va_acc
                 best_peer_epoch = epoch
+                torch.save(peer_model.state_dict(), run_dir / "best_peer_model.pt")
 
         if first_active_epoch is None and train_stats["student_selected_ratio"] > 0.0:
             first_active_epoch = epoch
@@ -1312,6 +1603,7 @@ def main():
             f"s_hot_ce={train_stats['student_hotspot_error_mean']:.4f} "
             f"s_bg_ce={train_stats['student_background_error_mean']:.4f} "
             f"s_gap={train_stats['student_hotspot_gap_mean']:.4f} "
+            f"s_aug={train_stats['student_aug_consistency_mean']:.4f} "
             f"val_loss={va_loss:.6f} val_acc={va_acc:.4f}"
         )
         if peer_va_loss is not None and peer_va_acc is not None:
@@ -1326,6 +1618,7 @@ def main():
                 f"p_hot_ce={train_stats['peer_hotspot_error_mean']:.4f} "
                 f"p_bg_ce={train_stats['peer_background_error_mean']:.4f} "
                 f"p_gap={train_stats['peer_hotspot_gap_mean']:.4f} "
+                f"p_aug={train_stats['peer_aug_consistency_mean']:.4f} "
                 f"peer_val_loss={peer_va_loss:.6f} peer_val_acc={peer_va_acc:.4f}"
             )
         print(status)
@@ -1353,12 +1646,20 @@ def main():
                 "ssml_per_class_budget": args.ssml_per_class_budget,
                 "ssml_peer_true_prob_threshold": args.ssml_peer_true_prob_threshold,
                 "ssml_peer_student_prob_gap_min": args.ssml_peer_student_prob_gap_min,
+                "ssml_aug_consistency_weight": args.ssml_aug_consistency_weight,
+                "ssml_aug_consistency_shift": args.ssml_aug_consistency_shift,
+                "ssml_aug_consistency_flip_prob": args.ssml_aug_consistency_flip_prob,
+                "ssml_aug_consistency_noise_std": args.ssml_aug_consistency_noise_std,
+                "ssml_peer_aug_consistency_min": args.ssml_peer_aug_consistency_min,
+                "ssml_student_aug_consistency_max": args.ssml_student_aug_consistency_max,
+                "ssml_peer_student_aug_consistency_gap_min": args.ssml_peer_student_aug_consistency_gap_min,
                 "ssml_freeze_peer": ssml_freeze_peer,
                 "ssml_worse_only_update": args.ssml_worse_only_update,
                 "ssml_anchor_weight": args.ssml_anchor_weight,
                 "init_checkpoint": loaded_init_checkpoint,
                 "peer_init_checkpoint": loaded_peer_init_checkpoint,
                 "guidance_scale": guidance_scale,
+                "freeze_bn_stats": args.freeze_bn_stats,
                 "train_loss": train_stats["train_loss"],
                 "train_acc": train_stats["train_acc"],
                 "student_positive_score_ratio": train_stats["student_positive_score_ratio"],
@@ -1396,6 +1697,8 @@ def main():
                 "peer_update_ratio": train_stats["peer_update_ratio"],
                 "student_selected_per_class": train_stats["student_selected_per_class"],
                 "peer_selected_per_class": train_stats["peer_selected_per_class"],
+                "student_aug_consistency_mean": train_stats["student_aug_consistency_mean"],
+                "peer_aug_consistency_mean": train_stats["peer_aug_consistency_mean"],
                 "anchor_loss_mean": train_stats["anchor_loss_mean"],
                 "first_active_epoch_so_far": first_active_epoch,
                 "best_val_acc_so_far": best_val_acc,
@@ -1451,6 +1754,14 @@ def main():
             f"useful_hard_ratio={last_train_stats['student_useful_hard_ratio']:.4f} "
             f"peer_true_prob_threshold={args.ssml_peer_true_prob_threshold:.3f} "
             f"peer_student_gap_min={args.ssml_peer_student_prob_gap_min:.3f} "
+            f"aug_consistency_w={args.ssml_aug_consistency_weight:.3f} "
+            f"aug_shift={args.ssml_aug_consistency_shift} "
+            f"aug_flip={args.ssml_aug_consistency_flip_prob:.2f} "
+            f"aug_noise={args.ssml_aug_consistency_noise_std:.3f} "
+            f"peer_aug_min={args.ssml_peer_aug_consistency_min:.3f} "
+            f"student_aug_max={args.ssml_student_aug_consistency_max:.3f} "
+            f"aug_gap_min={args.ssml_peer_student_aug_consistency_gap_min:.3f} "
+            f"freeze_bn={int(args.freeze_bn_stats)} "
             f"first_active_epoch={first_active_epoch} "
             f"best_before_active={before_text} "
             f"best_after_active={after_text}"
@@ -1502,11 +1813,19 @@ def main():
         "ssml_per_class_budget": args.ssml_per_class_budget,
         "ssml_peer_true_prob_threshold": args.ssml_peer_true_prob_threshold,
         "ssml_peer_student_prob_gap_min": args.ssml_peer_student_prob_gap_min,
+        "ssml_aug_consistency_weight": args.ssml_aug_consistency_weight,
+        "ssml_aug_consistency_shift": args.ssml_aug_consistency_shift,
+        "ssml_aug_consistency_flip_prob": args.ssml_aug_consistency_flip_prob,
+        "ssml_aug_consistency_noise_std": args.ssml_aug_consistency_noise_std,
+        "ssml_peer_aug_consistency_min": args.ssml_peer_aug_consistency_min,
+        "ssml_student_aug_consistency_max": args.ssml_student_aug_consistency_max,
+        "ssml_peer_student_aug_consistency_gap_min": args.ssml_peer_student_aug_consistency_gap_min,
         "ssml_freeze_peer": ssml_freeze_peer,
         "ssml_worse_only_update": args.ssml_worse_only_update,
         "ssml_anchor_weight": args.ssml_anchor_weight,
         "init_checkpoint": loaded_init_checkpoint,
         "peer_init_checkpoint": loaded_peer_init_checkpoint,
+        "freeze_bn_stats": args.freeze_bn_stats,
         "warmup_epochs": args.warmup_epochs,
         "imitation_decay_start_epoch": args.imitation_decay_start_epoch,
         "imitation_decay_end_epoch": args.imitation_decay_end_epoch,
@@ -1597,6 +1916,8 @@ def main():
         "peer_update_ratio": last_train_stats["peer_update_ratio"],
         "student_selected_per_class": last_train_stats["student_selected_per_class"],
         "peer_selected_per_class": last_train_stats["peer_selected_per_class"],
+        "student_aug_consistency_mean": last_train_stats["student_aug_consistency_mean"],
+        "peer_aug_consistency_mean": last_train_stats["peer_aug_consistency_mean"],
         "anchor_loss_mean": last_train_stats["anchor_loss_mean"],
     }
     if peer_model is not None:

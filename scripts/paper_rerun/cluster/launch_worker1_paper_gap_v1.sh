@@ -12,6 +12,8 @@ ENABLE_PLOT_WATCHER="${ENABLE_PLOT_WATCHER:-1}"
 mkdir -p "$LOG_DIR"
 
 PLOT_WATCH_PIDS=()
+PID_HOMO=""
+PID_HETERO=""
 
 start_plot_watch() {
   local label="$1"
@@ -68,6 +70,8 @@ run_logged_job \
     DOWNLOAD="${DOWNLOAD_HOMO:-1}" \
     bash scripts/paper_rerun/run_core_classification.sh \
   &
+PID_HOMO="$!"
+echo "[worker1_paper_gap_v1] started classification_homo_noise pid=$PID_HOMO gpu=${CLASSIFICATION_GPU0:-0}"
 
 run_logged_job \
   "worker1/classification_hetero_noise_v1" \
@@ -87,6 +91,8 @@ run_logged_job \
     DOWNLOAD="${DOWNLOAD_HETERO:-1}" \
     bash scripts/paper_rerun/run_core_classification.sh \
   &
+PID_HETERO="$!"
+echo "[worker1_paper_gap_v1] started classification_hetero_noise pid=$PID_HETERO gpu=${CLASSIFICATION_GPU1:-1}"
 
 wait
 

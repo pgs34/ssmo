@@ -1,0 +1,88 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_common.sh"
+activate_paper_env
+cd "$ROOT_DIR"
+
+LOG_DIR="${LOG_DIR:-results/logs/time_series_etth1_early_stop_v1}"
+mkdir -p "$LOG_DIR"
+
+DEVICE="${DEVICE:-cuda}"
+GPU="${GPU:-0}"
+SEEDS="${SEEDS:-0 1 2}"
+MODEL_PAIRS="${MODEL_PAIRS:-transformer:dlinear}"
+INDEPENDENT_MODELS="${INDEPENDENT_MODELS:-transformer}"
+EPOCHS="${EPOCHS:-15}"
+BATCH_SIZE="${BATCH_SIZE:-64}"
+NUM_WORKERS="${NUM_WORKERS:-4}"
+SEQ_LEN="${SEQ_LEN:-96}"
+PRED_LENS="${PRED_LENS:-24}"
+FEATURE_MODE="${FEATURE_MODE:-multivariate}"
+REGRESSION_IMITATION_LOSS="${REGRESSION_IMITATION_LOSS:-huber}"
+OUTPUT_DIR="${OUTPUT_DIR:-results/time_series_etth1_early_stop_v1}"
+LIVE_PLOT_INTERVAL="${LIVE_PLOT_INTERVAL:-1}"
+
+LAMBDA_IMITATION="${LAMBDA_IMITATION:-0.001}"
+MARGIN="${MARGIN:-0.02}"
+WARMUP_EPOCHS="${WARMUP_EPOCHS:-5}"
+IMITATION_DECAY_START_EPOCH="${IMITATION_DECAY_START_EPOCH:-10}"
+IMITATION_DECAY_END_EPOCH="${IMITATION_DECAY_END_EPOCH:-50}"
+IMITATION_DECAY_MIN_SCALE="${IMITATION_DECAY_MIN_SCALE:-0.1}"
+HETERO_SSML_ONE_WAY="${HETERO_SSML_ONE_WAY:-1}"
+SSML_TOPK_RATIO="${SSML_TOPK_RATIO:-0.02}"
+SSML_SUPERVISED_HOTSPOT_ALPHA="${SSML_SUPERVISED_HOTSPOT_ALPHA:-0.5}"
+SSML_GATE_SCORE_MODE="${SSML_GATE_SCORE_MODE:-peer_better_student_error}"
+SSML_SCORE_TRANSFORM="${SSML_SCORE_TRANSFORM:-none}"
+SSML_GUIDANCE_MODE="${SSML_GUIDANCE_MODE:-reweight_only}"
+EARLY_STOP_PATIENCE="${EARLY_STOP_PATIENCE:-2}"
+EARLY_STOP_MIN_EPOCHS="${EARLY_STOP_MIN_EPOCHS:-4}"
+EARLY_STOP_MIN_DELTA="${EARLY_STOP_MIN_DELTA:-0.0005}"
+
+echo "[time_series_etth1_early_stop_v1] output_dir=$OUTPUT_DIR"
+echo "[time_series_etth1_early_stop_v1] gpu=$GPU seeds=$SEEDS"
+echo "[time_series_etth1_early_stop_v1] model_pairs=$MODEL_PAIRS independent_models=$INDEPENDENT_MODELS"
+echo "[time_series_etth1_early_stop_v1] epochs=$EPOCHS early_stop=${EARLY_STOP_PATIENCE}/${EARLY_STOP_MIN_EPOCHS}/${EARLY_STOP_MIN_DELTA}"
+echo "[time_series_etth1_early_stop_v1] lambda=$LAMBDA_IMITATION margin=$MARGIN topk=$SSML_TOPK_RATIO warmup=$WARMUP_EPOCHS"
+echo "[time_series_etth1_early_stop_v1] ssml_supervised_hotspot_alpha=$SSML_SUPERVISED_HOTSPOT_ALPHA"
+echo "[time_series_etth1_early_stop_v1] ssml_gate_score_mode=$SSML_GATE_SCORE_MODE"
+echo "[time_series_etth1_early_stop_v1] ssml_score_transform=$SSML_SCORE_TRANSFORM"
+echo "[time_series_etth1_early_stop_v1] ssml_guidance_mode=$SSML_GUIDANCE_MODE"
+
+run_logged_job \
+  "etth1_early_stop_v1/all_methods" \
+  "$LOG_DIR/all_methods.log" \
+  env \
+    CUDA_VISIBLE_DEVICES="$GPU" \
+    METHODS="independent dml ssml" \
+    DATASETS="etth1" \
+    SEEDS="$SEEDS" \
+    MODEL_PAIRS="$MODEL_PAIRS" \
+    INDEPENDENT_MODELS="$INDEPENDENT_MODELS" \
+    REQUIRE_DISTINCT_PEER="1" \
+    EPOCHS="$EPOCHS" \
+    BATCH_SIZE="$BATCH_SIZE" \
+    NUM_WORKERS="$NUM_WORKERS" \
+    DEVICE="$DEVICE" \
+    OUTPUT_DIR="$OUTPUT_DIR" \
+    SEQ_LEN="$SEQ_LEN" \
+    PRED_LENS="$PRED_LENS" \
+    REGRESSION_IMITATION_LOSS="$REGRESSION_IMITATION_LOSS" \
+    LAMBDA_IMITATION="$LAMBDA_IMITATION" \
+    MARGIN="$MARGIN" \
+    WARMUP_EPOCHS="$WARMUP_EPOCHS" \
+    IMITATION_DECAY_START_EPOCH="$IMITATION_DECAY_START_EPOCH" \
+    IMITATION_DECAY_END_EPOCH="$IMITATION_DECAY_END_EPOCH" \
+    IMITATION_DECAY_MIN_SCALE="$IMITATION_DECAY_MIN_SCALE" \
+    SSML_TOPK_RATIO="$SSML_TOPK_RATIO" \
+    HETERO_SSML_ONE_WAY="$HETERO_SSML_ONE_WAY" \
+    SSML_SUPERVISED_HOTSPOT_ALPHA="$SSML_SUPERVISED_HOTSPOT_ALPHA" \
+    SSML_GATE_SCORE_MODE="$SSML_GATE_SCORE_MODE" \
+    SSML_SCORE_TRANSFORM="$SSML_SCORE_TRANSFORM" \
+    SSML_GUIDANCE_MODE="$SSML_GUIDANCE_MODE" \
+    FEATURE_MODE="$FEATURE_MODE" \
+    EARLY_STOP_PATIENCE="$EARLY_STOP_PATIENCE" \
+    EARLY_STOP_MIN_EPOCHS="$EARLY_STOP_MIN_EPOCHS" \
+    EARLY_STOP_MIN_DELTA="$EARLY_STOP_MIN_DELTA" \
+    LIVE_PLOT_INTERVAL="$LIVE_PLOT_INTERVAL" \
+    bash scripts/paper_rerun/run_core_time_series.sh

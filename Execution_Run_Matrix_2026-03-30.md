@@ -10,12 +10,13 @@
   - `FNO x DeepONet / Darcy`
   - `SSML < independent < DML`
 - `classification`: partially good
-  - `CIFAR-10 / homogeneous` is already competitive
-  - `CIFAR-100 / homogeneous` has some signal
+  - `CIFAR-10 / homogeneous` is already a clean win
+  - `CIFAR-100 / homogeneous` has signal and best clean SSML is now `0.532567 > 0.528533` independent, but comparable clean homogeneous `DML` reference is still not pinned down
   - `heterogeneous CNN x ViT` is still weak on clean IID
 - `time-series`: weakest overall
-  - `ETTh1` only is mildly positive
-  - `weather`, `electricity` still need algorithm work
+  - `Weather` is already positive
+  - `ETTh1` early-stop reruns removed the curve issue, but `independent` is still best
+  - `Electricity` still needs a strongest-baseline win
 
 ## 2. Ready-Now Matrix
 
@@ -121,13 +122,15 @@ These are in `Instruction.md` but not fully wired yet.
 ### Immediate paper-ready candidates
 
 - operator heterogeneous result
-- classification homogeneous clean/noise
-- time-series ETTh1 baseline comparison
+- classification homogeneous clean win on CIFAR-10
+- time-series weather comparison
 
 ### Still exploratory
 
 - classification hetero clean IID
-- weather / electricity SSML
+- electricity SSML strongest-baseline gap
+- CIFAR-100 homogeneous clean claim: larger margin and a comparable `DML` baseline
+- ETTh1 early-stop comparison as a diagnostic/control, not a win case
 
 ## 6. Output Layout
 
@@ -144,7 +147,9 @@ These are in `Instruction.md` but not fully wired yet.
 
 - worker1:
   - [launch_worker1_instruction_matrix_v1.sh](/home/namkyeong/ssmo/scripts/paper_rerun/cluster/launch_worker1_instruction_matrix_v1.sh)
+  - [launch_worker1_cifar100_alt_focus_v1.sh](/home/namkyeong/ssmo/scripts/paper_rerun/cluster/launch_worker1_cifar100_alt_focus_v1.sh)
 - worker2:
   - [launch_worker2_instruction_matrix_v1.sh](/home/namkyeong/ssmo/scripts/paper_rerun/cluster/launch_worker2_instruction_matrix_v1.sh)
+  - [launch_worker2_electricity_followup_v1.sh](/home/namkyeong/ssmo/scripts/paper_rerun/cluster/launch_worker2_electricity_followup_v1.sh)
 - worker3:
   - [launch_worker3_instruction_matrix_v1.sh](/home/namkyeong/ssmo/scripts/paper_rerun/cluster/launch_worker3_instruction_matrix_v1.sh)

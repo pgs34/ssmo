@@ -1,0 +1,4 @@
+[node0_cifar100_augfilter_seeded_v3] started gpu0 pid=2251131
+[node0_cifar100_augfilter_seeded_v3] started gpu1 pid=2251132
+[node0/cifar100_augfilter_seeded_v3_gpu0] log -> results/logs/classification_cifar100_augfilter_seeded_v3/node0/classification_gpu0_node0_gpu0.log
+[node0/cifar100_augfilter_seeded_v3_gpu1] log -> results/logs/classification_cifar100_augfilter_seeded_v3/node0/classification_gpu1_node0_gpu1.log

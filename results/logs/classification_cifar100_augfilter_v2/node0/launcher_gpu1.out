@@ -1,0 +1,6 @@
+[classification_cifar100_augfilter_v1] gpu=1 seeds=0 1 2
+[classification_cifar100_augfilter_v1] output_root=results/classification_cifar100_augfilter_v2/node0_gpu1
+[classification_cifar100_augfilter_v1] init_checkpoint_template=results/classification_neural_ode_cifar100_v11_backup/baseline/classification/{dataset}/{model}_independent_{classification_imitation_loss}_seed{seed}/model.pt
+[classification_cifar100_augfilter_v1] peer_init_checkpoint_template=results/classification_neural_ode_cifar100_v11_main/baseline/classification/{dataset}/{model}_independent_{classification_imitation_loss}_seed{seed}/model.pt
+[classification_cifar100_augfilter_v1] case_specs=pcu_pb20_thr38_gap20_augmin72_augmax90_agap03:peer_confident_student_uncertain:0.20:0.05:0.012:0.020:0.38:0.020:5:7.0:0.0004:0.82:0.90:2:0.50:0.02:0.72:0.90:0.03 pcu_pb22_thr40_gap20_augmin75_augmax90_agap04:peer_confident_student_uncertain:0.22:0.05:0.012:0.020:0.40:0.020:5:7.0:0.0004:0.80:0.90:2:0.50:0.02:0.75:0.90:0.04 pcu_pb24_thr38_gap25_augmin72_augmax88_agap04:peer_confident_student_uncertain:0.24:0.05:0.014:0.025:0.38:0.025:5:7.0:0.0005:0.85:0.90:2:0.50:0.02:0.72:0.88:0.04
+[classification_cifar100_augfilter_v1/pcu_pb20_thr38_gap20_augmin72_augmax90_agap03] log -> results/logs/classification_cifar100_augfilter_v1/pcu_pb20_thr38_gap20_augmin72_augmax90_agap03.log

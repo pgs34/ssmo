@@ -1,0 +1,4 @@
+[node0_etth1_teacher_ft_v2] started gpu0 pid=2146307
+[node0_etth1_teacher_ft_v2] started gpu1 pid=2146308
+[node0/etth1_teacher_ft_v2_gpu0] log -> results/logs/time_series_etth1_teacher_ft_v2/node0/time_series_gpu0_node0_gpu0.log
+[node0/etth1_teacher_ft_v2_gpu1] log -> results/logs/time_series_etth1_teacher_ft_v2/node0/time_series_gpu1_node0_gpu1.log

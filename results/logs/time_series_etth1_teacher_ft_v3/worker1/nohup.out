@@ -1,0 +1,3 @@
+[worker1_etth1_teacher_ft_v3_wait] started watchers pid0=215720 pid1=215721
+[2026-04-05 04:16:55] [worker1_etth1_teacher_ft_v3_wait] waiting for gpu=0 util<=10 mem<=3072 MiB
+[2026-04-05 04:16:55] [worker1_etth1_teacher_ft_v3_wait] waiting for gpu=1 util<=10 mem<=3072 MiB

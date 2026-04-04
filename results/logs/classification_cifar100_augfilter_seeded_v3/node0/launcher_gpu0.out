@@ -1,0 +1,6 @@
+[classification_cifar100_augfilter_v1] gpu=0 seeds=0 1 2
+[classification_cifar100_augfilter_v1] output_root=results/classification_cifar100_augfilter_seeded_v3/node0_gpu0
+[classification_cifar100_augfilter_v1] init_checkpoint_template=results/classification_neural_ode_cifar100_v11_backup/baseline/classification/{dataset}/{model}_independent_{classification_imitation_loss}_seed{seed}/model.pt
+[classification_cifar100_augfilter_v1] peer_init_checkpoint_template=results/classification_neural_ode_cifar100_v11_main/baseline/classification/{dataset}/{model}_independent_{classification_imitation_loss}_seed{seed}/model.pt
+[classification_cifar100_augfilter_v1] case_specs=uh_pb30_thr32_gap16_augmin70_augmax90_agap02:useful_hard_sample:0.30:0.06:0.012:0.016:0.32:0.016:4:6.0:0.0004:0.88:0.90:2:0.50:0.03:0.70:0.90:0.02 uhconf_pb18_thr37_gap24_augmin78_augmax93_agap03:useful_hard_sample_confident:0.18:0.04:0.010:0.024:0.37:0.024:5:6.5:0.0004:0.84:0.92:2:0.50:0.03:0.78:0.93:0.03
+[classification_cifar100_augfilter_v1/uh_pb30_thr32_gap16_augmin70_augmax90_agap02] lock -> /home/namkyeong/ssmo/results/.locks/results_classification_cifar100_augfilter_seeded_v3_node0_gpu0_uh_pb30_thr32_gap16_augmin70_augmax90_agap02_seeds_0_1_2.lock
