@@ -156,6 +156,9 @@ def parse_args():
     p.add_argument("--ssml-disagreement-only", action="store_true")
     p.add_argument("--ssml-class-balanced-topk", action="store_true")
     p.add_argument("--ssml-per-class-budget", type=int, default=0)
+    p.add_argument("--ssml-disagreement-floor-ratio", type=float, default=0.0)
+    p.add_argument("--ssml-deficit-ema-momentum", type=float, default=0.0)
+    p.add_argument("--ssml-extra-class-budget-scale", type=float, default=0.0)
     p.add_argument("--ssml-peer-true-prob-threshold", type=float, default=0.0)
     p.add_argument("--ssml-peer-student-prob-gap-min", type=float, default=0.0)
     p.add_argument("--ssml-aug-consistency-weight", type=float, default=0.0)
@@ -453,6 +456,7 @@ def build_class_balanced_topk_sample_mask(
     *,
     scope: str = "total",
     per_class_budget: int = 0,
+    per_class_budgets: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     if scores.ndim != 1:
         raise ValueError(f"Expected sample scores with shape [B], got: {tuple(scores.shape)}")
@@ -476,8 +480,13 @@ def build_class_balanced_topk_sample_mask(
             raise ValueError(f"Unsupported SSML top-k scope: {scope}")
         if candidate_count == 0:
             continue
-        if per_class_budget > 0:
-            k = min(candidate_count, per_class_budget)
+        class_budget = per_class_budget
+        if per_class_budgets is not None:
+            cls_idx = int(cls.item())
+            if 0 <= cls_idx < int(per_class_budgets.numel()):
+                class_budget = max(int(per_class_budgets[cls_idx].item()), 0)
+        if class_budget > 0:
+            k = min(candidate_count, class_budget)
         else:
             k = max(1, min(candidate_count, math.ceil(candidate_count * topk_ratio)))
         if k <= 0:
@@ -520,6 +529,108 @@ def selected_per_class(mask: torch.Tensor, targets: torch.Tensor) -> float:
         return 0.0
     class_count = max(int(torch.unique(active_targets).numel()), 1)
     return float(active_targets.numel() / class_count)
+
+
+def compute_js_divergence_from_probs(
+    student_prob: torch.Tensor,
+    peer_prob: torch.Tensor,
+) -> torch.Tensor:
+    student_prob = torch.clamp(student_prob, min=1e-8, max=1.0)
+    peer_prob = torch.clamp(peer_prob, min=1e-8, max=1.0)
+    mix = torch.clamp((student_prob + peer_prob) * 0.5, min=1e-8, max=1.0)
+    return 0.5 * (
+        F.kl_div(torch.log(student_prob), mix, reduction="none").sum(dim=1)
+        + F.kl_div(torch.log(peer_prob), mix, reduction="none").sum(dim=1)
+    )
+
+
+def compute_recall_by_class(
+    correct_by_class: torch.Tensor,
+    total_by_class: torch.Tensor,
+) -> torch.Tensor:
+    recall = torch.zeros_like(correct_by_class, dtype=torch.float32)
+    valid = total_by_class > 0
+    recall[valid] = correct_by_class[valid].to(dtype=torch.float32) / total_by_class[valid].to(dtype=torch.float32)
+    return recall
+
+
+def build_deficit_adjusted_class_budgets(
+    base_budget: int,
+    deficit_ema: torch.Tensor,
+    extra_budget_scale: float,
+) -> torch.Tensor:
+    class_count = int(deficit_ema.numel())
+    if class_count <= 0:
+        return torch.zeros(0, dtype=torch.long)
+    if base_budget <= 0:
+        return torch.zeros(class_count, dtype=torch.long, device=deficit_ema.device)
+    budgets = torch.full((class_count,), int(base_budget), dtype=torch.float32, device=deficit_ema.device)
+    if extra_budget_scale <= 0.0:
+        return budgets.round().to(dtype=torch.long)
+    positive = deficit_ema > 0
+    if bool(positive.any().item()):
+        mean_positive = deficit_ema[positive].mean()
+        normalized = deficit_ema / torch.clamp(mean_positive, min=1e-6)
+        scale = 1.0 + extra_budget_scale * (normalized - 1.0)
+        scale = torch.clamp(scale, min=0.25)
+        budgets = budgets * scale
+    return torch.clamp(budgets.round(), min=1.0).to(dtype=torch.long)
+
+
+@torch.no_grad()
+def evaluate_pair_classification_details(
+    model: torch.nn.Module,
+    peer_model: torch.nn.Module,
+    loader,
+    device: torch.device,
+    num_classes: int,
+) -> dict[str, float | list[float]]:
+    model.eval()
+    peer_model.eval()
+    total_loss = 0.0
+    total_acc = 0.0
+    total_peer_loss = 0.0
+    total_peer_acc = 0.0
+    total_disagreement = 0.0
+    total_count = 0
+    correct_by_class = torch.zeros(num_classes, dtype=torch.long, device=device)
+    total_by_class = torch.zeros(num_classes, dtype=torch.long, device=device)
+    peer_correct_by_class = torch.zeros(num_classes, dtype=torch.long, device=device)
+
+    for x, y in loader:
+        x = x.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
+        logits = model(x)
+        peer_logits = peer_model(x)
+        loss = F.cross_entropy(logits, y)
+        peer_loss = F.cross_entropy(peer_logits, y)
+        batch_size = x.size(0)
+        student_prob = F.softmax(logits, dim=1)
+        peer_prob = F.softmax(peer_logits, dim=1)
+        preds = student_prob.argmax(dim=1)
+        peer_preds = peer_prob.argmax(dim=1)
+        total_loss += float(loss.item()) * batch_size
+        total_acc += accuracy(logits, y) * batch_size
+        total_peer_loss += float(peer_loss.item()) * batch_size
+        total_peer_acc += accuracy(peer_logits, y) * batch_size
+        total_disagreement += float(compute_js_divergence_from_probs(student_prob, peer_prob).mean().item()) * batch_size
+        total_count += batch_size
+        total_by_class += torch.bincount(y, minlength=num_classes)
+        correct_by_class += torch.bincount(y[preds.eq(y)], minlength=num_classes)
+        peer_correct_by_class += torch.bincount(y[peer_preds.eq(y)], minlength=num_classes)
+
+    student_recall = compute_recall_by_class(correct_by_class, total_by_class).cpu()
+    peer_recall = compute_recall_by_class(peer_correct_by_class, total_by_class).cpu()
+    denom = max(total_count, 1)
+    return {
+        "val_loss": total_loss / denom,
+        "val_acc": total_acc / denom,
+        "peer_val_loss": total_peer_loss / denom,
+        "peer_val_acc": total_peer_acc / denom,
+        "mean_pair_disagreement": total_disagreement / denom,
+        "student_recall_by_class": student_recall.tolist(),
+        "peer_recall_by_class": peer_recall.tolist(),
+    }
 
 
 def transform_ssml_score_signal(
@@ -826,6 +937,9 @@ def train_one_epoch(
     ssml_disagreement_only: bool,
     ssml_class_balanced_topk: bool,
     ssml_per_class_budget: int,
+    num_classes: int,
+    ssml_dynamic_per_class_budget: Optional[torch.Tensor],
+    ssml_disagreement_floor: float,
     ssml_peer_true_prob_threshold: float,
     ssml_peer_student_prob_gap_min: float,
     ssml_student_true_prob_max: float,
@@ -899,6 +1013,9 @@ def train_one_epoch(
     total_student_aug_consistency_mean = 0.0
     total_peer_aug_consistency_mean = 0.0
     total_anchor_loss = 0.0
+    total_preserved_disagreement = 0.0
+    total_disagreement_floor_gap = 0.0
+    total_safe_teacher_miss_rate = torch.zeros(num_classes, dtype=torch.float32, device=device)
     total_count = 0
     for x, y in loader:
         x = x.to(device, non_blocking=True)
@@ -947,6 +1064,9 @@ def train_one_epoch(
         student_aug_consistency_mean = 0.0
         peer_aug_consistency_mean = 0.0
         anchor_loss_metric = 0.0
+        preserved_disagreement_mean = 0.0
+        disagreement_floor_gap_mean = 0.0
+        safe_teacher_miss_rate_by_class = torch.zeros(num_classes, dtype=torch.float32, device=device)
 
         if method == "independent":
             loss = supervised_loss.mean()
@@ -1110,6 +1230,7 @@ def train_one_epoch(
                     ssml_topk_ratio,
                     scope=ssml_topk_scope,
                     per_class_budget=ssml_per_class_budget,
+                    per_class_budgets=ssml_dynamic_per_class_budget,
                 )
                 mask_peer = build_class_balanced_topk_sample_mask(
                     peer_scores,
@@ -1117,6 +1238,7 @@ def train_one_epoch(
                     ssml_topk_ratio,
                     scope=ssml_topk_scope,
                     per_class_budget=ssml_per_class_budget,
+                    per_class_budgets=ssml_dynamic_per_class_budget,
                 )
             else:
                 mask_student = build_topk_sample_mask(student_scores, ssml_topk_ratio, scope=ssml_topk_scope)
@@ -1159,6 +1281,21 @@ def train_one_epoch(
                 )
                 imitation_term_student = weighted_mean(imit_student, imitation_weight_student)
                 loss = supervised_term_student + lambda_imitation * imitation_term_student
+
+            non_transfer_mask = ~(mask_student | mask_peer)
+            if ssml_disagreement_floor > 0.0 and bool(non_transfer_mask.any().item()):
+                live_student_prob = F.softmax(logits, dim=1)
+                live_peer_prob = (
+                    F.softmax(peer_logits.detach(), dim=1)
+                    if peer_update_disabled
+                    else F.softmax(peer_logits, dim=1)
+                )
+                disagreement_values = compute_js_divergence_from_probs(live_student_prob, live_peer_prob)
+                disagreement_gap = torch.clamp(ssml_disagreement_floor - disagreement_values, min=0.0)
+                preserve_loss = disagreement_gap[non_transfer_mask].mean()
+                loss = loss + lambda_imitation * preserve_loss
+                preserved_disagreement_mean = masked_tensor_mean(disagreement_values, non_transfer_mask)
+                disagreement_floor_gap_mean = masked_tensor_mean(disagreement_gap, non_transfer_mask)
 
             hotspot_weight_peer = build_sample_hotspot_weights(
                 peer_supervised_loss,
@@ -1221,6 +1358,12 @@ def train_one_epoch(
             peer_teacher_safe_ratio = float(peer_teacher_safe.float().mean().item())
             student_useful_hard_ratio = float(student_useful_hard.float().mean().item())
             peer_useful_hard_ratio = float(peer_useful_hard.float().mean().item())
+            class_totals = torch.bincount(y, minlength=num_classes).to(dtype=torch.float32)
+            safe_teacher_miss_counts = torch.bincount(y[student_useful_hard], minlength=num_classes).to(dtype=torch.float32)
+            valid_class_mask = class_totals > 0
+            safe_teacher_miss_rate_by_class[valid_class_mask] = (
+                safe_teacher_miss_counts[valid_class_mask] / class_totals[valid_class_mask]
+            )
             student_score_p90 = safe_quantile(student_scores, 0.9)
             peer_score_p90 = safe_quantile(peer_scores, 0.9)
             student_worse_ratio = float(worse_student_mask.float().mean().item())
@@ -1288,6 +1431,9 @@ def train_one_epoch(
         total_student_aug_consistency_mean += student_aug_consistency_mean * batch_size
         total_peer_aug_consistency_mean += peer_aug_consistency_mean * batch_size
         total_anchor_loss += anchor_loss_metric * batch_size
+        total_preserved_disagreement += preserved_disagreement_mean * batch_size
+        total_disagreement_floor_gap += disagreement_floor_gap_mean * batch_size
+        total_safe_teacher_miss_rate += safe_teacher_miss_rate_by_class * batch_size
         total_count += batch_size
     return {
         "train_loss": total_loss / total_count,
@@ -1330,6 +1476,9 @@ def train_one_epoch(
         "student_aug_consistency_mean": total_student_aug_consistency_mean / total_count,
         "peer_aug_consistency_mean": total_peer_aug_consistency_mean / total_count,
         "anchor_loss_mean": total_anchor_loss / total_count,
+        "preserved_disagreement_mean": total_preserved_disagreement / total_count,
+        "disagreement_floor_gap_mean": total_disagreement_floor_gap / total_count,
+        "student_safe_teacher_miss_rate_by_class": (total_safe_teacher_miss_rate / total_count).cpu().tolist(),
     }
 
 
@@ -1488,7 +1637,41 @@ def main():
         "student_aug_consistency_mean": 0.0,
         "peer_aug_consistency_mean": 0.0,
         "anchor_loss_mean": 0.0,
+        "preserved_disagreement_mean": 0.0,
+        "disagreement_floor_gap_mean": 0.0,
+        "student_safe_teacher_miss_rate_by_class": [0.0 for _ in range(num_classes)],
     }
+    warmstart_pair_disagreement = 0.0
+    disagreement_floor = 0.0
+    class_deficit_ema = torch.zeros(num_classes, dtype=torch.float32)
+    current_class_budget = (
+        build_deficit_adjusted_class_budgets(
+            args.ssml_per_class_budget,
+            class_deficit_ema,
+            args.ssml_extra_class_budget_scale,
+        )
+        if args.ssml_class_balanced_topk and args.ssml_per_class_budget > 0
+        else None
+    )
+    last_student_recall_by_class = [0.0 for _ in range(num_classes)]
+    last_peer_recall_by_class = [0.0 for _ in range(num_classes)]
+    last_class_budget_by_class = (
+        current_class_budget.tolist() if current_class_budget is not None else [0 for _ in range(num_classes)]
+    )
+    last_class_deficit_ema = class_deficit_ema.tolist()
+
+    if args.method == "ssml" and peer_model is not None and args.ssml_disagreement_floor_ratio > 0.0:
+        warmstart_stats = evaluate_pair_classification_details(
+            model,
+            peer_model,
+            val_loader,
+            device,
+            num_classes,
+        )
+        warmstart_pair_disagreement = float(warmstart_stats["mean_pair_disagreement"])
+        disagreement_floor = warmstart_pair_disagreement * max(args.ssml_disagreement_floor_ratio, 0.0)
+        last_student_recall_by_class = list(warmstart_stats["student_recall_by_class"])
+        last_peer_recall_by_class = list(warmstart_stats["peer_recall_by_class"])
 
     for epoch in range(1, args.epochs + 1):
         effective_lambda = compute_effective_lambda(
@@ -1533,6 +1716,9 @@ def main():
             ssml_disagreement_only=args.ssml_disagreement_only,
             ssml_class_balanced_topk=args.ssml_class_balanced_topk,
             ssml_per_class_budget=args.ssml_per_class_budget,
+            num_classes=num_classes,
+            ssml_dynamic_per_class_budget=current_class_budget,
+            ssml_disagreement_floor=disagreement_floor,
             ssml_peer_true_prob_threshold=args.ssml_peer_true_prob_threshold,
             ssml_peer_student_prob_gap_min=args.ssml_peer_student_prob_gap_min,
             ssml_student_true_prob_max=args.ssml_student_true_prob_max,
@@ -1554,11 +1740,25 @@ def main():
             anchor_params=anchor_params,
         )
         last_train_stats = train_stats
-        va_loss, va_acc = evaluate(model, val_loader, device)
-        peer_va_loss = None
-        peer_va_acc = None
+        pair_val_details = None
         if peer_model is not None:
-            peer_va_loss, peer_va_acc = evaluate(peer_model, val_loader, device)
+            pair_val_details = evaluate_pair_classification_details(
+                model,
+                peer_model,
+                val_loader,
+                device,
+                num_classes,
+            )
+            va_loss = float(pair_val_details["val_loss"])
+            va_acc = float(pair_val_details["val_acc"])
+            peer_va_loss = float(pair_val_details["peer_val_loss"])
+            peer_va_acc = float(pair_val_details["peer_val_acc"])
+            last_student_recall_by_class = list(pair_val_details["student_recall_by_class"])
+            last_peer_recall_by_class = list(pair_val_details["peer_recall_by_class"])
+        else:
+            va_loss, va_acc = evaluate(model, val_loader, device)
+            peer_va_loss = None
+            peer_va_acc = None
 
         train_loss_curve.append(train_stats["train_loss"])
         train_acc_curve.append(train_stats["train_acc"])
@@ -1575,6 +1775,26 @@ def main():
                 best_peer_val_acc = peer_va_acc
                 best_peer_epoch = epoch
                 torch.save(peer_model.state_dict(), run_dir / "best_peer_model.pt")
+
+        if args.method == "ssml" and args.ssml_class_balanced_topk and args.ssml_per_class_budget > 0:
+            if pair_val_details is not None:
+                student_recall_tensor = torch.tensor(pair_val_details["student_recall_by_class"], dtype=torch.float32)
+                peer_recall_tensor = torch.tensor(pair_val_details["peer_recall_by_class"], dtype=torch.float32)
+                deficit_signal = torch.clamp(peer_recall_tensor - student_recall_tensor, min=0.0)
+            else:
+                deficit_signal = torch.tensor(train_stats["student_safe_teacher_miss_rate_by_class"], dtype=torch.float32)
+            momentum = float(max(0.0, min(args.ssml_deficit_ema_momentum, 0.999)))
+            if momentum > 0.0:
+                class_deficit_ema = momentum * class_deficit_ema + (1.0 - momentum) * deficit_signal
+            else:
+                class_deficit_ema = deficit_signal
+            current_class_budget = build_deficit_adjusted_class_budgets(
+                args.ssml_per_class_budget,
+                class_deficit_ema,
+                args.ssml_extra_class_budget_scale,
+            )
+            last_class_deficit_ema = class_deficit_ema.tolist()
+            last_class_budget_by_class = current_class_budget.tolist()
 
         if first_active_epoch is None and train_stats["student_selected_ratio"] > 0.0:
             first_active_epoch = epoch
@@ -1600,6 +1820,8 @@ def main():
             f"s_safe={train_stats['student_teacher_safe_ratio']:.4f} "
             f"s_uh={train_stats['student_useful_hard_ratio']:.4f} "
             f"dis={train_stats['prediction_disagreement_ratio']:.4f} "
+            f"dis_keep={train_stats['preserved_disagreement_mean']:.4f} "
+            f"dis_gap={train_stats['disagreement_floor_gap_mean']:.4f} "
             f"s_hot_ce={train_stats['student_hotspot_error_mean']:.4f} "
             f"s_bg_ce={train_stats['student_background_error_mean']:.4f} "
             f"s_gap={train_stats['student_hotspot_gap_mean']:.4f} "
@@ -1644,6 +1866,9 @@ def main():
                 "ssml_disagreement_only": args.ssml_disagreement_only,
                 "ssml_class_balanced_topk": args.ssml_class_balanced_topk,
                 "ssml_per_class_budget": args.ssml_per_class_budget,
+                "ssml_disagreement_floor_ratio": args.ssml_disagreement_floor_ratio,
+                "ssml_deficit_ema_momentum": args.ssml_deficit_ema_momentum,
+                "ssml_extra_class_budget_scale": args.ssml_extra_class_budget_scale,
                 "ssml_peer_true_prob_threshold": args.ssml_peer_true_prob_threshold,
                 "ssml_peer_student_prob_gap_min": args.ssml_peer_student_prob_gap_min,
                 "ssml_aug_consistency_weight": args.ssml_aug_consistency_weight,
@@ -1700,6 +1925,15 @@ def main():
                 "student_aug_consistency_mean": train_stats["student_aug_consistency_mean"],
                 "peer_aug_consistency_mean": train_stats["peer_aug_consistency_mean"],
                 "anchor_loss_mean": train_stats["anchor_loss_mean"],
+                "preserved_disagreement_mean": train_stats["preserved_disagreement_mean"],
+                "disagreement_floor_gap_mean": train_stats["disagreement_floor_gap_mean"],
+                "warmstart_pair_disagreement": warmstart_pair_disagreement,
+                "disagreement_floor": disagreement_floor,
+                "student_safe_teacher_miss_rate_by_class": train_stats["student_safe_teacher_miss_rate_by_class"],
+                "student_val_recall_by_class": last_student_recall_by_class,
+                "peer_val_recall_by_class": last_peer_recall_by_class,
+                "class_deficit_ema": last_class_deficit_ema,
+                "dynamic_class_budget_by_class": last_class_budget_by_class,
                 "first_active_epoch_so_far": first_active_epoch,
                 "best_val_acc_so_far": best_val_acc,
                 "best_epoch_so_far": best_epoch,
@@ -1752,6 +1986,10 @@ def main():
             f"student_incorrect_only={args.ssml_student_incorrect_only} "
             f"student_true_prob_max={args.ssml_student_true_prob_max:.3f} "
             f"useful_hard_ratio={last_train_stats['student_useful_hard_ratio']:.4f} "
+            f"warmstart_dis={warmstart_pair_disagreement:.4f} "
+            f"dis_floor={disagreement_floor:.4f} "
+            f"preserved_dis={last_train_stats['preserved_disagreement_mean']:.4f} "
+            f"dis_gap={last_train_stats['disagreement_floor_gap_mean']:.4f} "
             f"peer_true_prob_threshold={args.ssml_peer_true_prob_threshold:.3f} "
             f"peer_student_gap_min={args.ssml_peer_student_prob_gap_min:.3f} "
             f"aug_consistency_w={args.ssml_aug_consistency_weight:.3f} "
@@ -1811,6 +2049,9 @@ def main():
         "ssml_disagreement_only": args.ssml_disagreement_only,
         "ssml_class_balanced_topk": args.ssml_class_balanced_topk,
         "ssml_per_class_budget": args.ssml_per_class_budget,
+        "ssml_disagreement_floor_ratio": args.ssml_disagreement_floor_ratio,
+        "ssml_deficit_ema_momentum": args.ssml_deficit_ema_momentum,
+        "ssml_extra_class_budget_scale": args.ssml_extra_class_budget_scale,
         "ssml_peer_true_prob_threshold": args.ssml_peer_true_prob_threshold,
         "ssml_peer_student_prob_gap_min": args.ssml_peer_student_prob_gap_min,
         "ssml_aug_consistency_weight": args.ssml_aug_consistency_weight,
@@ -1919,6 +2160,15 @@ def main():
         "student_aug_consistency_mean": last_train_stats["student_aug_consistency_mean"],
         "peer_aug_consistency_mean": last_train_stats["peer_aug_consistency_mean"],
         "anchor_loss_mean": last_train_stats["anchor_loss_mean"],
+        "preserved_disagreement_mean": last_train_stats["preserved_disagreement_mean"],
+        "disagreement_floor_gap_mean": last_train_stats["disagreement_floor_gap_mean"],
+        "warmstart_pair_disagreement": warmstart_pair_disagreement,
+        "disagreement_floor": disagreement_floor,
+        "student_safe_teacher_miss_rate_by_class": last_train_stats["student_safe_teacher_miss_rate_by_class"],
+        "student_val_recall_by_class": last_student_recall_by_class,
+        "peer_val_recall_by_class": last_peer_recall_by_class,
+        "class_deficit_ema": last_class_deficit_ema,
+        "dynamic_class_budget_by_class": last_class_budget_by_class,
     }
     if peer_model is not None:
         summary.update(

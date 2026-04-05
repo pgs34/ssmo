@@ -29,6 +29,9 @@ HETERO_SSML_ONE_WAY="${HETERO_SSML_ONE_WAY:-0}"
 SSML_STUDENT_ONLY="${SSML_STUDENT_ONLY:-0}"
 SSML_FREEZE_PEER="${SSML_FREEZE_PEER:-0}"
 OPERATOR_WEIGHT_GRANULARITY="${OPERATOR_WEIGHT_GRANULARITY:-sample}"
+RELAY_STAGE_EPOCHS="${RELAY_STAGE_EPOCHS:-}"
+RELAY_HINT_MODE="${RELAY_HINT_MODE:-full}"
+RELAY_TAPER_SCHEDULE="${RELAY_TAPER_SCHEDULE:-linear}"
 INIT_CHECKPOINT_TEMPLATE="${INIT_CHECKPOINT_TEMPLATE:-}"
 PEER_INIT_CHECKPOINT_TEMPLATE="${PEER_INIT_CHECKPOINT_TEMPLATE:-}"
 DOWNLOAD="${DOWNLOAD:-0}"
@@ -36,6 +39,9 @@ DOWNLOAD="${DOWNLOAD:-0}"
 echo "[operator] output_dir=$OUTPUT_DIR"
 echo "[operator] methods=$METHODS"
 echo "[operator] model_pairs=$MODEL_PAIRS"
+echo "[operator] relay_stage_epochs=$RELAY_STAGE_EPOCHS"
+echo "[operator] relay_hint_mode=$RELAY_HINT_MODE"
+echo "[operator] relay_taper_schedule=$RELAY_TAPER_SCHEDULE"
 
 for dataset in $DATASETS; do
   for method in $METHODS; do
@@ -63,6 +69,9 @@ for dataset in $DATASETS; do
             --imitation-decay-end-epoch "$IMITATION_DECAY_END_EPOCH"
             --imitation-decay-min-scale "$IMITATION_DECAY_MIN_SCALE"
             --operator-weight-granularity "$OPERATOR_WEIGHT_GRANULARITY"
+            --relay-stage-epochs "$RELAY_STAGE_EPOCHS"
+            --relay-hint-mode "$RELAY_HINT_MODE"
+            --relay-taper-schedule "$RELAY_TAPER_SCHEDULE"
           )
 
           init_checkpoint="${INIT_CHECKPOINT_TEMPLATE//\{seed\}/$seed}"
@@ -114,6 +123,9 @@ for dataset in $DATASETS; do
           --imitation-decay-end-epoch "$IMITATION_DECAY_END_EPOCH"
           --imitation-decay-min-scale "$IMITATION_DECAY_MIN_SCALE"
           --operator-weight-granularity "$OPERATOR_WEIGHT_GRANULARITY"
+          --relay-stage-epochs "$RELAY_STAGE_EPOCHS"
+          --relay-hint-mode "$RELAY_HINT_MODE"
+          --relay-taper-schedule "$RELAY_TAPER_SCHEDULE"
         )
 
         init_checkpoint="${INIT_CHECKPOINT_TEMPLATE//\{seed\}/$seed}"

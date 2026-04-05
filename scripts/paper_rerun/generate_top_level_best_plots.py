@@ -370,11 +370,18 @@ def build_operator_plot() -> Path:
         "val_mse",
     )
     burgers_ssml = mean_curve(
-        [
-            ROOT / "results/operator_burgers_followup_v1/burgers_l005_m0_w12_d60_120_ow1/operator/burgers/fno__deeponet_ssml_mse_seed0/curves.npz",
-            ROOT / "results/operator_burgers_followup_v1/burgers_l005_m0_w12_d60_120_ow1/operator/burgers/fno__deeponet_ssml_mse_seed1/curves.npz",
-            ROOT / "results/operator_burgers_followup_v1/burgers_l005_m0_w12_d60_120_ow1/operator/burgers/fno__deeponet_ssml_mse_seed2/curves.npz",
-        ],
+        prefer_existing_paths(
+            [
+                ROOT / "results/operator_burgers_fno_polish_fair_v2/worker3_gpu0/fno_polish_coarse_l002_w24_d90_170/operator/burgers/fno__deeponet_ssml_mse_seed0/curves.npz",
+                ROOT / "results/operator_burgers_fno_polish_fair_v2/worker3_gpu0/fno_polish_coarse_l002_w24_d90_170/operator/burgers/fno__deeponet_ssml_mse_seed1/curves.npz",
+                ROOT / "results/operator_burgers_fno_polish_fair_v2/worker3_gpu0/fno_polish_coarse_l002_w24_d90_170/operator/burgers/fno__deeponet_ssml_mse_seed2/curves.npz",
+            ],
+            [
+                ROOT / "results/operator_burgers_followup_v1/burgers_l005_m0_w12_d60_120_ow1/operator/burgers/fno__deeponet_ssml_mse_seed0/curves.npz",
+                ROOT / "results/operator_burgers_followup_v1/burgers_l005_m0_w12_d60_120_ow1/operator/burgers/fno__deeponet_ssml_mse_seed1/curves.npz",
+                ROOT / "results/operator_burgers_followup_v1/burgers_l005_m0_w12_d60_120_ow1/operator/burgers/fno__deeponet_ssml_mse_seed2/curves.npz",
+            ],
+        ),
         "val_mse",
     )
     plot_panel(

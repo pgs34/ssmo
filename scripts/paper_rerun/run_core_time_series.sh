@@ -27,6 +27,7 @@ WARMUP_EPOCHS="${WARMUP_EPOCHS:-3}"
 IMITATION_DECAY_START_EPOCH="${IMITATION_DECAY_START_EPOCH:--1}"
 IMITATION_DECAY_END_EPOCH="${IMITATION_DECAY_END_EPOCH:--1}"
 IMITATION_DECAY_MIN_SCALE="${IMITATION_DECAY_MIN_SCALE:-1.0}"
+SSML_HANDOFF_END_EPOCH="${SSML_HANDOFF_END_EPOCH:--1}"
 HETERO_SSML_ONE_WAY="${HETERO_SSML_ONE_WAY:-0}"
 SSML_STUDENT_ONLY="${SSML_STUDENT_ONLY:-0}"
 SSML_FREEZE_PEER="${SSML_FREEZE_PEER:-0}"
@@ -63,6 +64,9 @@ SSML_CORRECTION_PEER_ADVANTAGE_QUANTILE="${SSML_CORRECTION_PEER_ADVANTAGE_QUANTI
 SSML_CORRECTION_PEER_ADVANTAGE_MIN="${SSML_CORRECTION_PEER_ADVANTAGE_MIN:-0.0}"
 SSML_CORRECTION_PEER_ADVANTAGE_SMOOTHING_KERNEL="${SSML_CORRECTION_PEER_ADVANTAGE_SMOOTHING_KERNEL:-1}"
 SSML_CORRECTION_BUDGET_RATIO="${SSML_CORRECTION_BUDGET_RATIO:-0.0}"
+SSML_ROUTER_BIN_ENDPOINTS="${SSML_ROUTER_BIN_ENDPOINTS:-}"
+SSML_ROUTER_EMA_DECAY="${SSML_ROUTER_EMA_DECAY:-0.0}"
+SSML_TREND_ONLY_TEACHING="${SSML_TREND_ONLY_TEACHING:-0}"
 SSML_CORRECTION_FEATURE_MODE="${SSML_CORRECTION_FEATURE_MODE:-basic}"
 SSML_CORRECTION_USE_REGIME_FEATURES="${SSML_CORRECTION_USE_REGIME_FEATURES:-0}"
 SSML_CORRECTION_DECOMPOSITION_KERNEL="${SSML_CORRECTION_DECOMPOSITION_KERNEL:-9}"
@@ -140,6 +144,10 @@ echo "[time_series] ssml_correction_peer_advantage_quantile=$SSML_CORRECTION_PEE
 echo "[time_series] ssml_correction_peer_advantage_min=$SSML_CORRECTION_PEER_ADVANTAGE_MIN"
 echo "[time_series] ssml_correction_peer_advantage_smoothing_kernel=$SSML_CORRECTION_PEER_ADVANTAGE_SMOOTHING_KERNEL"
 echo "[time_series] ssml_correction_budget_ratio=$SSML_CORRECTION_BUDGET_RATIO"
+echo "[time_series] ssml_handoff_end_epoch=$SSML_HANDOFF_END_EPOCH"
+echo "[time_series] ssml_router_bin_endpoints=$SSML_ROUTER_BIN_ENDPOINTS"
+echo "[time_series] ssml_router_ema_decay=$SSML_ROUTER_EMA_DECAY"
+echo "[time_series] ssml_trend_only_teaching=$SSML_TREND_ONLY_TEACHING"
 echo "[time_series] ssml_correction_feature_mode=$SSML_CORRECTION_FEATURE_MODE"
 echo "[time_series] ssml_correction_use_regime_features=$SSML_CORRECTION_USE_REGIME_FEATURES"
 echo "[time_series] ssml_correction_decomposition_kernel=$SSML_CORRECTION_DECOMPOSITION_KERNEL"
@@ -191,6 +199,7 @@ for dataset in $DATASETS; do
               --imitation-decay-start-epoch "$IMITATION_DECAY_START_EPOCH"
               --imitation-decay-end-epoch "$IMITATION_DECAY_END_EPOCH"
               --imitation-decay-min-scale "$IMITATION_DECAY_MIN_SCALE"
+              --ssml-handoff-end-epoch "$SSML_HANDOFF_END_EPOCH"
               --ssml-topk-ratio "$SSML_TOPK_RATIO"
               --ssml-topk-scope "$SSML_TOPK_SCOPE"
               --ssml-max-selected-ratio "$SSML_MAX_SELECTED_RATIO"
@@ -221,6 +230,8 @@ for dataset in $DATASETS; do
               --ssml-correction-peer-advantage-min "$SSML_CORRECTION_PEER_ADVANTAGE_MIN"
               --ssml-correction-peer-advantage-smoothing-kernel "$SSML_CORRECTION_PEER_ADVANTAGE_SMOOTHING_KERNEL"
               --ssml-correction-budget-ratio "$SSML_CORRECTION_BUDGET_RATIO"
+              --ssml-router-bin-endpoints "$SSML_ROUTER_BIN_ENDPOINTS"
+              --ssml-router-ema-decay "$SSML_ROUTER_EMA_DECAY"
               --ssml-correction-feature-mode "$SSML_CORRECTION_FEATURE_MODE"
               --ssml-correction-decomposition-kernel "$SSML_CORRECTION_DECOMPOSITION_KERNEL"
               --ssml-correction-trend-scale "$SSML_CORRECTION_TREND_SCALE"
@@ -260,6 +271,9 @@ for dataset in $DATASETS; do
             fi
             if [[ "$SSML_CORRECTION_ONLY" == "1" ]]; then
               cmd+=(--ssml-correction-only)
+            fi
+            if [[ "$SSML_TREND_ONLY_TEACHING" == "1" ]]; then
+              cmd+=(--ssml-trend-only-teaching)
             fi
             cmd+=(--ssml-anchor-weight "$SSML_ANCHOR_WEIGHT")
             if [[ -n "$init_checkpoint" ]]; then
@@ -306,6 +320,7 @@ for dataset in $DATASETS; do
             --imitation-decay-start-epoch "$IMITATION_DECAY_START_EPOCH"
             --imitation-decay-end-epoch "$IMITATION_DECAY_END_EPOCH"
             --imitation-decay-min-scale "$IMITATION_DECAY_MIN_SCALE"
+            --ssml-handoff-end-epoch "$SSML_HANDOFF_END_EPOCH"
             --ssml-topk-ratio "$SSML_TOPK_RATIO"
             --ssml-topk-scope "$SSML_TOPK_SCOPE"
             --ssml-max-selected-ratio "$SSML_MAX_SELECTED_RATIO"
@@ -336,6 +351,8 @@ for dataset in $DATASETS; do
             --ssml-correction-peer-advantage-min "$SSML_CORRECTION_PEER_ADVANTAGE_MIN"
             --ssml-correction-peer-advantage-smoothing-kernel "$SSML_CORRECTION_PEER_ADVANTAGE_SMOOTHING_KERNEL"
             --ssml-correction-budget-ratio "$SSML_CORRECTION_BUDGET_RATIO"
+            --ssml-router-bin-endpoints "$SSML_ROUTER_BIN_ENDPOINTS"
+            --ssml-router-ema-decay "$SSML_ROUTER_EMA_DECAY"
             --ssml-correction-feature-mode "$SSML_CORRECTION_FEATURE_MODE"
             --ssml-correction-decomposition-kernel "$SSML_CORRECTION_DECOMPOSITION_KERNEL"
             --ssml-correction-trend-scale "$SSML_CORRECTION_TREND_SCALE"
@@ -375,6 +392,9 @@ for dataset in $DATASETS; do
           fi
           if [[ "$SSML_CORRECTION_ONLY" == "1" ]]; then
             cmd+=(--ssml-correction-only)
+          fi
+          if [[ "$SSML_TREND_ONLY_TEACHING" == "1" ]]; then
+            cmd+=(--ssml-trend-only-teaching)
           fi
           cmd+=(--ssml-anchor-weight "$SSML_ANCHOR_WEIGHT")
           if [[ -n "$init_checkpoint" ]]; then

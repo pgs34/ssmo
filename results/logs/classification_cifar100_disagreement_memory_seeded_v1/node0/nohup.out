@@ -1,0 +1,4 @@
+[node0_cifar100_disagreement_memory_seeded_v1] started gpu0 pid=3647051
+[node0_cifar100_disagreement_memory_seeded_v1] started gpu1 pid=3647052
+[node0/cifar100_disagreement_memory_seeded_v1_gpu1] log -> results/logs/classification_cifar100_disagreement_memory_seeded_v1/node0/classification_gpu1_node0_gpu1.log
+[node0/cifar100_disagreement_memory_seeded_v1_gpu0] log -> results/logs/classification_cifar100_disagreement_memory_seeded_v1/node0/classification_gpu0_node0_gpu0.log

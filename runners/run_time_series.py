@@ -96,6 +96,7 @@ def parse_args():
     p.add_argument("--imitation-decay-start-epoch", type=int, default=-1)
     p.add_argument("--imitation-decay-end-epoch", type=int, default=-1)
     p.add_argument("--imitation-decay-min-scale", type=float, default=1.0)
+    p.add_argument("--ssml-handoff-end-epoch", type=int, default=-1)
     p.add_argument("--hetero-ssml-one-way", action="store_true")
     p.add_argument("--ssml-student-only", action="store_true")
     p.add_argument("--ssml-freeze-peer", action="store_true")
@@ -176,6 +177,9 @@ def parse_args():
     p.add_argument("--ssml-correction-peer-advantage-min", type=float, default=0.0)
     p.add_argument("--ssml-correction-peer-advantage-smoothing-kernel", type=int, default=1)
     p.add_argument("--ssml-correction-budget-ratio", type=float, default=0.0)
+    p.add_argument("--ssml-router-bin-endpoints", type=str, default="")
+    p.add_argument("--ssml-router-ema-decay", type=float, default=0.0)
+    p.add_argument("--ssml-trend-only-teaching", action="store_true")
     p.add_argument(
         "--ssml-correction-feature-mode",
         type=str,
@@ -442,10 +446,23 @@ def build_residual_teacher_target(
     student_pred: torch.Tensor,
     teacher_pred: torch.Tensor,
     beta: float,
+    *,
+    trend_only: bool = False,
+    trend_kernel: int = 9,
 ) -> torch.Tensor:
     base = student_pred.detach()
     teacher = teacher_pred.detach()
     beta = float(max(0.0, min(1.0, beta)))
+    if trend_only:
+        student_trend, student_residual = decompose_forecast_trend_residual(base, trend_kernel)
+        teacher_trend, _ = decompose_forecast_trend_residual(teacher, trend_kernel)
+        if beta >= 1.0:
+            target_trend = teacher_trend
+        elif beta <= 0.0:
+            target_trend = student_trend
+        else:
+            target_trend = student_trend + beta * (teacher_trend - student_trend)
+        return target_trend + student_residual
     if beta >= 1.0:
         return teacher
     if beta <= 0.0:
@@ -651,6 +668,119 @@ def build_tail_horizon_mask(
     mask = torch.zeros(shape, dtype=torch.bool, device=reference.device)
     mask[:, start_index:, ...] = True
     return mask.expand_as(reference)
+
+
+def parse_horizon_router_bin_endpoints(
+    spec: str,
+    pred_len: int,
+) -> list[int]:
+    pred_len = max(int(pred_len), 1)
+    if spec.strip():
+        endpoints = []
+        for token in spec.split(","):
+            token = token.strip()
+            if not token:
+                continue
+            endpoints.append(int(token))
+    else:
+        endpoints = [min(8, pred_len), min(16, pred_len), pred_len]
+    cleaned = sorted({max(1, min(pred_len, value)) for value in endpoints})
+    if not cleaned or cleaned[-1] != pred_len:
+        cleaned.append(pred_len)
+    return cleaned
+
+
+def build_horizon_router_tensor(
+    reference: torch.Tensor,
+    router_weights: Optional[torch.Tensor],
+    bin_endpoints: Optional[list[int]],
+) -> torch.Tensor:
+    if router_weights is None or router_weights.numel() == 0 or not bin_endpoints:
+        return torch.ones_like(reference, dtype=reference.dtype)
+    router_weights = router_weights.to(device=reference.device, dtype=reference.dtype)
+    scale = torch.ones(
+        [1, reference.shape[1], *([1] * max(reference.ndim - 2, 0))],
+        device=reference.device,
+        dtype=reference.dtype,
+    )
+    start = 0
+    for idx, end in enumerate(bin_endpoints):
+        end = max(start + 1, min(int(end), reference.shape[1]))
+        weight = router_weights[min(idx, int(router_weights.numel()) - 1)]
+        scale[:, start:end, ...] = weight
+        start = end
+        if start >= reference.shape[1]:
+            break
+    return scale.expand_as(reference)
+
+
+def compute_horizon_bin_relative_gains(
+    student_error: torch.Tensor,
+    teacher_error: torch.Tensor,
+    bin_endpoints: Optional[list[int]],
+) -> torch.Tensor:
+    if not bin_endpoints:
+        return student_error.new_zeros((0,), dtype=torch.float32)
+    gains = []
+    start = 0
+    for end in bin_endpoints:
+        end = max(start + 1, min(int(end), student_error.shape[1]))
+        student_slice = student_error[:, start:end, ...]
+        teacher_slice = teacher_error[:, start:end, ...]
+        student_mean = student_slice.mean()
+        teacher_mean = teacher_slice.mean()
+        if float(student_mean.item()) <= 0.0:
+            gains.append(student_mean.new_tensor(0.0))
+        else:
+            gains.append(torch.clamp((student_mean - teacher_mean) / torch.clamp(student_mean, min=1e-6), min=0.0))
+        start = end
+        if start >= student_error.shape[1]:
+            break
+    return torch.stack(gains).to(dtype=torch.float32)
+
+
+def update_horizon_router_state(
+    previous_gains: Optional[torch.Tensor],
+    current_gains: torch.Tensor,
+    ema_decay: float,
+) -> torch.Tensor:
+    current_gains = torch.clamp(current_gains.detach().to(dtype=torch.float32), min=0.0)
+    if current_gains.numel() == 0:
+        if previous_gains is None:
+            return current_gains
+        return previous_gains.to(dtype=torch.float32)
+    if previous_gains is None or previous_gains.numel() != current_gains.numel():
+        return current_gains
+    ema_decay = float(max(0.0, min(ema_decay, 0.9999)))
+    if ema_decay <= 0.0:
+        return current_gains
+    return ema_decay * previous_gains.to(dtype=torch.float32) + (1.0 - ema_decay) * current_gains
+
+
+def build_horizon_router_weights(router_gains: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+    if router_gains is None:
+        return None
+    router_gains = torch.clamp(router_gains.detach().to(dtype=torch.float32), min=0.0)
+    if router_gains.numel() == 0:
+        return router_gains
+    max_gain = float(router_gains.max().item())
+    if max_gain <= 0.0:
+        return torch.ones_like(router_gains)
+    normalized = router_gains / max_gain
+    return 0.25 + 0.75 * normalized
+
+
+def apply_ssml_handoff(
+    *,
+    epoch: int,
+    handoff_end_epoch: int,
+    lambda_imitation: float,
+    guidance_scale: float,
+    correction_apply_scale: float,
+) -> tuple[float, float, float, bool]:
+    if handoff_end_epoch >= 0 and epoch > handoff_end_epoch:
+        return 0.0, 0.0, 0.0, True
+    return lambda_imitation, guidance_scale, correction_apply_scale, False
 
 
 def conflict_project_gradients(
@@ -1110,6 +1240,9 @@ def compute_corrective_prediction(
     residual_scale: float,
     budget_ratio: float,
     focus_mask: Optional[torch.Tensor] = None,
+    horizon_router_weights: Optional[torch.Tensor] = None,
+    horizon_router_bin_endpoints: Optional[list[int]] = None,
+    trend_only_teaching: bool = False,
     detach_gate_inputs: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     gate_student_pred = student_pred.detach() if detach_gate_inputs else student_pred
@@ -1132,6 +1265,13 @@ def compute_corrective_prediction(
         if focus is not None:
             trend_gate = trend_gate * focus
             residual_gate = residual_gate * focus
+        router_scale = build_horizon_router_tensor(
+            trend_gate,
+            horizon_router_weights,
+            horizon_router_bin_endpoints,
+        )
+        trend_gate = trend_gate * router_scale
+        residual_gate = residual_gate * router_scale
         candidate_mask = (
             focus > 0
             if focus is not None
@@ -1147,6 +1287,9 @@ def compute_corrective_prediction(
             residual_gate = residual_gate * budget_mask
         student_trend, student_residual = decompose_forecast_trend_residual(student_pred, decomposition_kernel)
         teacher_trend, teacher_residual = decompose_forecast_trend_residual(teacher_pred.detach(), decomposition_kernel)
+        if trend_only_teaching:
+            residual_gate = torch.zeros_like(residual_gate)
+            teacher_residual = student_residual.detach()
         corrected_pred = (
             student_trend
             + trend_gate * guidance_scale * trend_scale * (teacher_trend - student_trend)
@@ -1156,10 +1299,27 @@ def compute_corrective_prediction(
         effective_gate = torch.maximum(trend_gate, residual_gate)
         return corrected_pred, effective_gate, gate_logits
 
-    delta = teacher_pred - student_pred
+    teacher_target = (
+        build_residual_teacher_target(
+            student_pred,
+            teacher_pred,
+            1.0,
+            trend_only=True,
+            trend_kernel=decomposition_kernel,
+        )
+        if trend_only_teaching
+        else teacher_pred
+    )
+    delta = teacher_target - student_pred
     gate = torch.sigmoid(gate_logits)
     if focus is not None:
         gate = gate * focus
+    router_scale = build_horizon_router_tensor(
+        gate,
+        horizon_router_weights,
+        horizon_router_bin_endpoints,
+    )
+    gate = gate * router_scale
     candidate_mask = (
         focus > 0
         if focus is not None
@@ -1192,6 +1352,7 @@ def train_one_epoch(
     elementwise_imitation_loss_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
     lambda_imitation: float,
     margin: float,
+    ssml_handoff_end_epoch: int,
     ssml_topk_ratio: float,
     ssml_supervised_hotspot_alpha: float,
     ssml_supervised_weight_mode: str,
@@ -1226,6 +1387,10 @@ def train_one_epoch(
     ssml_correction_peer_advantage_min: float,
     ssml_correction_peer_advantage_smoothing_kernel: int,
     ssml_correction_budget_ratio: float,
+    ssml_router_bin_endpoints: Optional[list[int]],
+    ssml_student_horizon_router_weights: Optional[torch.Tensor],
+    ssml_peer_horizon_router_weights: Optional[torch.Tensor],
+    ssml_trend_only_teaching: bool,
     ssml_correction_feature_mode: str,
     ssml_correction_use_regime_features: bool,
     ssml_correction_decomposition_kernel: int,
@@ -1295,6 +1460,8 @@ def train_one_epoch(
     total_conflict_cosine = 0.0
     total_conflict_projection_applied_ratio = 0.0
     total_correction_focus_ratio = 0.0
+    student_router_gain_total = None
+    peer_router_gain_total = None
     total_count = 0
     for x, y in loader:
         x = x.to(device, non_blocking=True)
@@ -1344,6 +1511,8 @@ def train_one_epoch(
         conflict_cosine_metric = 0.0
         conflict_projection_applied_ratio = 0.0
         correction_focus_ratio_metric = 1.0
+        student_router_gain_metric = None
+        peer_router_gain_metric = None
 
         if method == "independent":
             loss = supervised_term_student
@@ -1429,6 +1598,9 @@ def train_one_epoch(
                     residual_scale=ssml_correction_residual_scale,
                     budget_ratio=ssml_correction_budget_ratio,
                     focus_mask=correction_focus_mask,
+                    horizon_router_weights=ssml_student_horizon_router_weights,
+                    horizon_router_bin_endpoints=ssml_router_bin_endpoints,
+                    trend_only_teaching=ssml_trend_only_teaching,
                 )
                 corrected_sup_elementwise = F.mse_loss(corrected_pred, y, reduction="none")
                 correction_focus_weights = 1.0 + ssml_correction_focus_loss_alpha * correction_focus_mask.to(
@@ -1496,6 +1668,17 @@ def train_one_epoch(
                 student_update_ratio = active_ratio_metric
                 anchor_loss_metric = float(sparsity_penalty.item())
                 peer_error_mean = float(sup_peer_elementwise.detach().mean().item())
+                if ssml_router_bin_endpoints:
+                    student_router_gain_metric = compute_horizon_bin_relative_gains(
+                        sup_student_elementwise.detach(),
+                        sup_peer_elementwise.detach(),
+                        ssml_router_bin_endpoints,
+                    )
+                    peer_router_gain_metric = compute_horizon_bin_relative_gains(
+                        sup_peer_elementwise.detach(),
+                        sup_student_elementwise.detach(),
+                        ssml_router_bin_endpoints,
+                    )
                 continue_batch = False
             else:
                 continue_batch = True
@@ -1579,6 +1762,17 @@ def train_one_epoch(
                     tail_mask_peer = build_tail_horizon_mask(peer_scores, ssml_tail_start_ratio)
                     student_scores = student_scores * tail_mask_student.to(dtype=student_scores.dtype)
                     peer_scores = peer_scores * tail_mask_peer.to(dtype=peer_scores.dtype)
+                if ssml_router_bin_endpoints:
+                    student_scores = student_scores * build_horizon_router_tensor(
+                        student_scores,
+                        ssml_student_horizon_router_weights,
+                        ssml_router_bin_endpoints,
+                    )
+                    peer_scores = peer_scores * build_horizon_router_tensor(
+                        peer_scores,
+                        ssml_peer_horizon_router_weights,
+                        ssml_router_bin_endpoints,
+                    )
 
             if continue_batch:
                 mask_student_imitate = build_topk_element_mask(
@@ -1631,6 +1825,14 @@ def train_one_epoch(
                     mask_peer_imitate = torch.zeros_like(mask_peer_imitate, dtype=torch.bool)
 
                 student_teacher_target = build_residual_teacher_target(pred, teacher_pred_student, ssml_residual_beta)
+                if ssml_trend_only_teaching:
+                    student_teacher_target = build_residual_teacher_target(
+                        pred,
+                        teacher_pred_student,
+                        ssml_residual_beta,
+                        trend_only=True,
+                        trend_kernel=ssml_correction_decomposition_kernel,
+                    )
                 history_target = x[:, :, : pred.shape[-1]]
                 imit_student_source = build_imitation_representation(
                     pred,
@@ -1688,6 +1890,14 @@ def train_one_epoch(
                     peer_loss = supervised_term_peer
                 else:
                     peer_teacher_target = build_residual_teacher_target(peer_pred, teacher_pred_peer, ssml_residual_beta)
+                    if ssml_trend_only_teaching:
+                        peer_teacher_target = build_residual_teacher_target(
+                            peer_pred,
+                            teacher_pred_peer,
+                            ssml_residual_beta,
+                            trend_only=True,
+                            trend_kernel=ssml_correction_decomposition_kernel,
+                        )
                     peer_history_target = x[:, :, : peer_pred.shape[-1]]
                     imit_peer_source = build_imitation_representation(
                         peer_pred,
@@ -1776,6 +1986,17 @@ def train_one_epoch(
                     student_hotspot_error_share = float((sup_student[mask_student_imitate].sum() / sup_student.sum()).item())
                 if peer_total_error > 0.0 and bool(mask_peer_imitate.any().item()):
                     peer_hotspot_error_share = float((sup_peer[mask_peer_imitate].sum() / sup_peer.sum()).item())
+                if ssml_router_bin_endpoints:
+                    student_router_gain_metric = compute_horizon_bin_relative_gains(
+                        sup_student.detach(),
+                        score_teacher_student.detach(),
+                        ssml_router_bin_endpoints,
+                    )
+                    peer_router_gain_metric = compute_horizon_bin_relative_gains(
+                        sup_peer.detach(),
+                        score_teacher_peer.detach(),
+                        ssml_router_bin_endpoints,
+                    )
 
         else:
             raise ValueError(f"Unsupported method '{method}'")
@@ -1818,6 +2039,17 @@ def train_one_epoch(
         total_conflict_cosine += conflict_cosine_metric * batch_size
         total_conflict_projection_applied_ratio += conflict_projection_applied_ratio * batch_size
         total_correction_focus_ratio += correction_focus_ratio_metric * batch_size
+        if ssml_router_bin_endpoints and student_router_gain_metric is not None:
+            if student_router_gain_total is None:
+                student_router_gain_total = student_router_gain_metric.detach() * batch_size
+                peer_router_gain_total = peer_router_gain_metric.detach() * batch_size if peer_router_gain_metric is not None else None
+            else:
+                student_router_gain_total += student_router_gain_metric.detach() * batch_size
+                if peer_router_gain_metric is not None:
+                    if peer_router_gain_total is None:
+                        peer_router_gain_total = peer_router_gain_metric.detach() * batch_size
+                    else:
+                        peer_router_gain_total += peer_router_gain_metric.detach() * batch_size
         total_count += batch_size
 
     denom = max(total_count, 1)
@@ -1859,6 +2091,16 @@ def train_one_epoch(
         "conflict_cosine": total_conflict_cosine / denom,
         "conflict_projection_applied_ratio": total_conflict_projection_applied_ratio / denom,
         "correction_focus_ratio": total_correction_focus_ratio / denom,
+        "student_horizon_router_relative_gains": (
+            (student_router_gain_total / denom).cpu().tolist()
+            if student_router_gain_total is not None
+            else []
+        ),
+        "peer_horizon_router_relative_gains": (
+            (peer_router_gain_total / denom).cpu().tolist()
+            if peer_router_gain_total is not None
+            else []
+        ),
     }
 
 
@@ -1878,6 +2120,9 @@ def evaluate(
     correction_peer_advantage_min: float = 0.0,
     correction_peer_advantage_smoothing_kernel: int = 1,
     correction_budget_ratio: float = 0.0,
+    horizon_router_weights: Optional[torch.Tensor] = None,
+    horizon_router_bin_endpoints: Optional[list[int]] = None,
+    trend_only_teaching: bool = False,
     correction_feature_mode: str = "basic",
     correction_use_regime_features: bool = False,
     correction_decomposition_kernel: int = 9,
@@ -1917,6 +2162,9 @@ def evaluate(
                 correction_gate,
                 guidance_scale=guidance_scale * correction_apply_scale,
                 focus_mask=correction_focus_mask,
+                horizon_router_weights=horizon_router_weights,
+                horizon_router_bin_endpoints=horizon_router_bin_endpoints,
+                trend_only_teaching=trend_only_teaching,
                 feature_mode=correction_feature_mode,
                 use_regime_features=correction_use_regime_features,
                 decomposition_kernel=correction_decomposition_kernel,
@@ -2103,8 +2351,16 @@ def main():
         "conflict_cosine": 0.0,
         "conflict_projection_applied_ratio": 0.0,
         "correction_focus_ratio": 1.0,
+        "student_horizon_router_relative_gains": [],
+        "peer_horizon_router_relative_gains": [],
     }
     hetero_ssml_one_way = args.hetero_ssml_one_way and pair_meta["is_heterogeneous_pair"]
+    router_enabled = bool(args.ssml_router_bin_endpoints.strip()) or args.ssml_router_ema_decay > 0.0
+    router_bin_endpoints = parse_horizon_router_bin_endpoints(args.ssml_router_bin_endpoints, args.pred_len) if router_enabled else []
+    student_router_gain_state = torch.zeros(len(router_bin_endpoints), dtype=torch.float32) if router_enabled else None
+    peer_router_gain_state = torch.zeros(len(router_bin_endpoints), dtype=torch.float32) if router_enabled else None
+    student_router_weights = build_horizon_router_weights(student_router_gain_state) if router_enabled else None
+    peer_router_weights = build_horizon_router_weights(peer_router_gain_state) if router_enabled else None
 
     for epoch in range(1, args.epochs + 1):
         effective_lambda = compute_effective_lambda(
@@ -2133,9 +2389,18 @@ def main():
             if corrective_mode
             else 1.0
         )
+        effective_lambda, guidance_scale, correction_apply_scale, handoff_applied = apply_ssml_handoff(
+            epoch=epoch,
+            handoff_end_epoch=args.ssml_handoff_end_epoch,
+            lambda_imitation=effective_lambda,
+            guidance_scale=guidance_scale,
+            correction_apply_scale=correction_apply_scale,
+        )
         correction_freeze_student = (
             corrective_mode and epoch <= max(args.ssml_correction_freeze_student_epochs, 0)
         )
+        epoch_student_router_weights = student_router_weights.clone() if student_router_weights is not None else None
+        epoch_peer_router_weights = peer_router_weights.clone() if peer_router_weights is not None else None
 
         train_stats = train_one_epoch(
             model,
@@ -2152,6 +2417,7 @@ def main():
             elementwise_imitation_loss_fn=elementwise_imitation_loss_fn,
             lambda_imitation=effective_lambda,
             margin=args.margin,
+            ssml_handoff_end_epoch=args.ssml_handoff_end_epoch,
             ssml_topk_ratio=args.ssml_topk_ratio,
             ssml_supervised_hotspot_alpha=args.ssml_supervised_hotspot_alpha,
             ssml_supervised_weight_mode=args.ssml_supervised_weight_mode,
@@ -2186,6 +2452,10 @@ def main():
             ssml_correction_peer_advantage_min=args.ssml_correction_peer_advantage_min,
             ssml_correction_peer_advantage_smoothing_kernel=args.ssml_correction_peer_advantage_smoothing_kernel,
             ssml_correction_budget_ratio=args.ssml_correction_budget_ratio,
+            ssml_router_bin_endpoints=router_bin_endpoints,
+            ssml_student_horizon_router_weights=epoch_student_router_weights,
+            ssml_peer_horizon_router_weights=epoch_peer_router_weights,
+            ssml_trend_only_teaching=args.ssml_trend_only_teaching,
             ssml_correction_feature_mode=args.ssml_correction_feature_mode,
             ssml_correction_use_regime_features=args.ssml_correction_use_regime_features,
             ssml_correction_decomposition_kernel=args.ssml_correction_decomposition_kernel,
@@ -2217,12 +2487,28 @@ def main():
             correction_peer_advantage_min=args.ssml_correction_peer_advantage_min,
             correction_peer_advantage_smoothing_kernel=args.ssml_correction_peer_advantage_smoothing_kernel,
             correction_budget_ratio=args.ssml_correction_budget_ratio,
+            horizon_router_weights=epoch_student_router_weights,
+            horizon_router_bin_endpoints=router_bin_endpoints,
+            trend_only_teaching=args.ssml_trend_only_teaching,
             correction_feature_mode=args.ssml_correction_feature_mode,
             correction_use_regime_features=args.ssml_correction_use_regime_features,
             correction_decomposition_kernel=args.ssml_correction_decomposition_kernel,
             correction_trend_scale=args.ssml_correction_trend_scale,
             correction_residual_scale=args.ssml_correction_residual_scale,
         )
+        if router_enabled:
+            student_router_gain_state = update_horizon_router_state(
+                student_router_gain_state,
+                torch.tensor(train_stats["student_horizon_router_relative_gains"], dtype=torch.float32),
+                args.ssml_router_ema_decay,
+            )
+            peer_router_gain_state = update_horizon_router_state(
+                peer_router_gain_state,
+                torch.tensor(train_stats["peer_horizon_router_relative_gains"], dtype=torch.float32),
+                args.ssml_router_ema_decay,
+            )
+            student_router_weights = build_horizon_router_weights(student_router_gain_state)
+            peer_router_weights = build_horizon_router_weights(peer_router_gain_state)
         peer_va_mse = None
         peer_va_mae = None
         if peer_model is not None:
@@ -2276,6 +2562,7 @@ def main():
             f"[time_series][epoch {epoch:03d}] "
             f"lambda={effective_lambda:.4f} "
             f"g_scale={guidance_scale:.3f} "
+            f"handoff={int(handoff_applied)} "
             f"corr_scale={correction_apply_scale:.3f} "
             f"freeze_student={int(correction_freeze_student)} "
             f"focus={train_stats['correction_focus_ratio']:.4f} "
@@ -2349,6 +2636,10 @@ def main():
                 "ssml_ema_decay": args.ssml_ema_decay,
                 "ssml_imitation_space": args.ssml_imitation_space,
                 "ssml_residual_space_kernel": args.ssml_residual_space_kernel,
+                "ssml_handoff_end_epoch": args.ssml_handoff_end_epoch,
+                "ssml_router_bin_endpoints": router_bin_endpoints,
+                "ssml_router_ema_decay": args.ssml_router_ema_decay,
+                "ssml_trend_only_teaching": args.ssml_trend_only_teaching,
                 "ssml_conflict_aware_projection": args.ssml_conflict_aware_projection,
                 "ssml_guidance_mode": args.ssml_guidance_mode,
                 "ssml_correction_init_bias": args.ssml_correction_init_bias,
@@ -2369,6 +2660,7 @@ def main():
                 "ssml_correction_trend_scale": args.ssml_correction_trend_scale,
                 "ssml_correction_residual_scale": args.ssml_correction_residual_scale,
                 "guidance_scale": guidance_scale,
+                "handoff_applied": handoff_applied,
                 "correction_apply_scale": correction_apply_scale,
                 "correction_freeze_student": correction_freeze_student,
                 "train_total": train_stats["train_total"],
@@ -2408,6 +2700,10 @@ def main():
                 "conflict_cosine": train_stats["conflict_cosine"],
                 "conflict_projection_applied_ratio": train_stats["conflict_projection_applied_ratio"],
                 "correction_focus_ratio": train_stats["correction_focus_ratio"],
+                "student_horizon_router_relative_gains": train_stats["student_horizon_router_relative_gains"],
+                "peer_horizon_router_relative_gains": train_stats["peer_horizon_router_relative_gains"],
+                "student_horizon_router_weights": epoch_student_router_weights.tolist() if epoch_student_router_weights is not None else [],
+                "peer_horizon_router_weights": epoch_peer_router_weights.tolist() if epoch_peer_router_weights is not None else [],
                 "first_active_epoch_so_far": first_active_epoch,
                 "best_val_mse_so_far": best_val_mse,
                 "best_epoch_so_far": best_epoch,
@@ -2515,6 +2811,7 @@ def main():
             f"adaptive_dense_thr={args.ssml_adaptive_dense_threshold:.3f} "
             f"positive_upper_q={args.ssml_positive_upper_quantile:.3f} "
             f"guidance_schedule=warmup_then_decay "
+            f"handoff_end={args.ssml_handoff_end_epoch} "
             f"correction_init_bias={args.ssml_correction_init_bias:.3f} "
             f"correction_ramp={args.ssml_correction_ramp_start_epoch}->{args.ssml_correction_ramp_end_epoch} "
             f"correction_freeze_student_epochs={args.ssml_correction_freeze_student_epochs} "
@@ -2526,6 +2823,9 @@ def main():
             f"correction_peer_adv_min={args.ssml_correction_peer_advantage_min:.4f} "
             f"correction_peer_adv_k={args.ssml_correction_peer_advantage_smoothing_kernel} "
             f"correction_budget_ratio={args.ssml_correction_budget_ratio:.3f} "
+            f"router_bins={router_bin_endpoints} "
+            f"router_ema={args.ssml_router_ema_decay:.3f} "
+            f"trend_only={int(args.ssml_trend_only_teaching)} "
             f"correction_feature_mode={args.ssml_correction_feature_mode} "
             f"correction_regime={int(args.ssml_correction_use_regime_features)} "
             f"correction_decomp_k={args.ssml_correction_decomposition_kernel} "
@@ -2599,6 +2899,7 @@ def main():
         "imitation_decay_start_epoch": args.imitation_decay_start_epoch,
         "imitation_decay_end_epoch": args.imitation_decay_end_epoch,
         "imitation_decay_min_scale": args.imitation_decay_min_scale,
+        "ssml_handoff_end_epoch": args.ssml_handoff_end_epoch,
         "hetero_ssml_one_way": hetero_ssml_one_way,
         "ssml_one_way_rule": (
             "disabled_in_reweight_only"
@@ -2631,6 +2932,9 @@ def main():
         "ssml_ema_decay": args.ssml_ema_decay,
         "ssml_imitation_space": args.ssml_imitation_space,
         "ssml_residual_space_kernel": args.ssml_residual_space_kernel,
+        "ssml_router_bin_endpoints": router_bin_endpoints,
+        "ssml_router_ema_decay": args.ssml_router_ema_decay,
+        "ssml_trend_only_teaching": args.ssml_trend_only_teaching,
         "ssml_conflict_aware_projection": args.ssml_conflict_aware_projection,
         "ssml_guidance_mode": args.ssml_guidance_mode,
         "ssml_correction_gate_hidden_dim": args.ssml_correction_gate_hidden_dim,
@@ -2691,6 +2995,7 @@ def main():
         "best_val_mse_after_activation_epoch": best_val_after_activation_epoch,
         "final_val_mse": val_mse_curve[-1],
         "final_val_mae": val_mae_curve[-1],
+        "best_final_gap": val_mse_curve[-1] - best_val_mse,
         "best_metric": best_val_mse,
         "best_metric_key": "mse",
         "final_metric": val_mse_curve[-1],
@@ -2703,6 +3008,10 @@ def main():
         "num_parameters": model_param_count + correction_gate_param_count,
         "num_parameters1": model_param_count + correction_gate_param_count,
         "num_parameters_correction_gate": correction_gate_param_count,
+        "student_horizon_router_relative_gains": last_train_stats["student_horizon_router_relative_gains"],
+        "peer_horizon_router_relative_gains": last_train_stats["peer_horizon_router_relative_gains"],
+        "student_horizon_router_weights": student_router_weights.tolist() if student_router_weights is not None else [],
+        "peer_horizon_router_weights": peer_router_weights.tolist() if peer_router_weights is not None else [],
         "meta": meta,
     }
     if peer_model is not None:

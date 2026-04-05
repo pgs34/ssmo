@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -11,6 +12,7 @@ from src.methods import get_directional_weight_builder, weighted_mean
 from src.models.operator import build_operator_model
 from src.tasks.operator import OperatorDataConfig, build_operator_dataloaders
 from src.utils import (
+    append_jsonl,
     build_pair_metadata,
     canonicalize_method_name,
     count_parameters,
@@ -70,6 +72,9 @@ def parse_args():
     p.add_argument("--ssml-student-only", action="store_true")
     p.add_argument("--ssml-freeze-peer", action="store_true")
     p.add_argument("--operator-weight-granularity", type=str, default="sample", choices=["sample", "element"])
+    p.add_argument("--relay-stage-epochs", type=str, default="")
+    p.add_argument("--relay-hint-mode", type=str, default="full", choices=["full", "coarse", "hotspot"])
+    p.add_argument("--relay-taper-schedule", type=str, default="linear", choices=["linear", "cosine", "constant"])
     p.add_argument("--init-checkpoint", type=str, default=None)
     p.add_argument("--peer-init-checkpoint", type=str, default=None)
     p.add_argument("--live-plot-interval", type=int, default=20)
@@ -168,6 +173,84 @@ def compute_effective_lambda(
     return base_lambda * scale
 
 
+def parse_relay_stage_epochs(spec: str) -> tuple[int, int, int]:
+    if not spec.strip():
+        return (0, 0, 0)
+    values = [int(token.strip()) for token in spec.split(",") if token.strip()]
+    if len(values) != 3:
+        raise ValueError(
+            f"relay-stage-epochs must contain exactly three comma-separated integers, got: {spec!r}"
+        )
+    return tuple(max(value, 0) for value in values)
+
+
+def compute_relay_curriculum(
+    epoch: int,
+    stage_epochs: tuple[int, int, int],
+    taper_schedule: str,
+) -> tuple[str, float]:
+    stage0_epochs, stage1_epochs, stage2_epochs = stage_epochs
+    if stage0_epochs + stage1_epochs + stage2_epochs <= 0:
+        return "disabled", 1.0
+    if epoch <= stage0_epochs:
+        return "control", 0.0
+    if epoch <= stage0_epochs + stage1_epochs:
+        return "relay", 1.0
+    if epoch <= stage0_epochs + stage1_epochs + stage2_epochs:
+        if stage2_epochs <= 0:
+            return "finetune", 0.0
+        if stage2_epochs == 1:
+            progress = 1.0
+        else:
+            progress = (epoch - stage0_epochs - stage1_epochs - 1) / max(stage2_epochs - 1, 1)
+        progress = float(max(0.0, min(1.0, progress)))
+        if taper_schedule == "linear":
+            scale = 1.0 - progress
+        elif taper_schedule == "cosine":
+            scale = 0.5 * (1.0 + math.cos(math.pi * progress))
+        else:
+            scale = 1.0
+        return "taper", float(max(scale, 0.0))
+    return "finetune", 0.0
+
+
+def build_low_frequency_operator_hint(tensor: torch.Tensor) -> torch.Tensor:
+    flat = tensor.detach().reshape(tensor.shape[0], 1, -1)
+    if flat.shape[-1] <= 2:
+        return tensor.detach()
+    kernel = max(3, min(int(flat.shape[-1] // 32) * 2 + 1, min(int(flat.shape[-1]), 31)))
+    if kernel % 2 == 0:
+        kernel += 1
+    kernel = min(kernel, int(flat.shape[-1]) if int(flat.shape[-1]) % 2 == 1 else max(int(flat.shape[-1]) - 1, 1))
+    if kernel <= 1:
+        return tensor.detach()
+    pad = kernel // 2
+    smoothed = F.avg_pool1d(F.pad(flat, (pad, pad), mode="replicate"), kernel_size=kernel, stride=1)
+    return smoothed.reshape_as(tensor).detach()
+
+
+def build_operator_teacher_hint(
+    student_pred: torch.Tensor,
+    teacher_pred: torch.Tensor,
+    target: torch.Tensor,
+    *,
+    hint_mode: str,
+    margin: float,
+) -> tuple[torch.Tensor, float]:
+    if hint_mode == "full":
+        return teacher_pred.detach(), 1.0
+    if hint_mode == "coarse":
+        return build_low_frequency_operator_hint(teacher_pred), 0.0
+    if hint_mode == "hotspot":
+        student_error = F.mse_loss(student_pred.detach(), target.detach(), reduction="none")
+        teacher_error = F.mse_loss(teacher_pred.detach(), target.detach(), reduction="none")
+        hotspot_mask = (student_error - teacher_error) > margin
+        hotspot_ratio = float(hotspot_mask.to(dtype=torch.float32).mean().item()) if hotspot_mask.numel() > 0 else 0.0
+        hint = torch.where(hotspot_mask, teacher_pred.detach(), student_pred.detach())
+        return hint, hotspot_ratio
+    raise ValueError(f"Unsupported relay hint mode: {hint_mode}")
+
+
 def choose_one_way_imitation(
     student_supervised_loss: torch.Tensor,
     peer_supervised_loss: torch.Tensor,
@@ -207,6 +290,9 @@ def train_one_epoch(
     lambda_imitation: float,
     margin: float,
     method: str,
+    relay_scale: float = 1.0,
+    relay_stage: str = "disabled",
+    relay_hint_mode: str = "full",
     hetero_ssml_one_way: bool = False,
     peer_update_disabled: bool = False,
     operator_weight_granularity: str = "sample",
@@ -221,6 +307,7 @@ def train_one_epoch(
     dml_weight_builder = get_directional_weight_builder("dml")
     ssml_weight_builder = get_directional_weight_builder("ssml")
     total_loss = 0.0
+    total_relay_hotspot_ratio = 0.0
     total_count = 0
     for batch in loader:
         x, y = unpack_batch(batch)
@@ -233,6 +320,8 @@ def train_one_epoch(
         pred = model(x)
         supervised_loss_map = supervised_elementwise_loss_fn(pred, y)
         supervised_loss = reduce_loss_per_sample(supervised_loss_map)
+        batch_relay_hotspot_ratio = 0.0
+        relay_lambda = lambda_imitation * max(float(relay_scale), 0.0)
 
         if method == "independent":
             loss = supervised_loss.mean()
@@ -262,28 +351,42 @@ def train_one_epoch(
                 peer_weight_source,
                 margin=margin,
             )
-            if lambda_imitation <= 0.0:
+            if relay_lambda <= 0.0:
                 w_student = torch.zeros_like(w_student)
                 w_peer = torch.zeros_like(w_peer)
+            student_hint_target, batch_relay_hotspot_ratio = build_operator_teacher_hint(
+                pred,
+                peer_pred,
+                y,
+                hint_mode=relay_hint_mode,
+                margin=margin,
+            )
             imitation_student_values = (
-                elementwise_imitation_loss_fn(pred, peer_pred)
+                elementwise_imitation_loss_fn(pred, student_hint_target)
                 if operator_weight_granularity == "element"
-                else imitation_loss_fn(pred, peer_pred)
+                else imitation_loss_fn(pred, student_hint_target)
             )
             imitation_student = weighted_mean(imitation_student_values, w_student)
 
-            loss = supervised_loss.mean() + lambda_imitation * imitation_student
+            loss = supervised_loss.mean() + relay_lambda * imitation_student
             if peer_update_disabled:
                 loss.backward()
                 optimizer.step()
             else:
+                peer_hint_target, _ = build_operator_teacher_hint(
+                    peer_pred,
+                    pred,
+                    y,
+                    hint_mode=relay_hint_mode,
+                    margin=margin,
+                )
                 imitation_peer_values = (
-                    elementwise_imitation_loss_fn(peer_pred, pred)
+                    elementwise_imitation_loss_fn(peer_pred, peer_hint_target)
                     if operator_weight_granularity == "element"
-                    else imitation_loss_fn(peer_pred, pred)
+                    else imitation_loss_fn(peer_pred, peer_hint_target)
                 )
                 imitation_peer = weighted_mean(imitation_peer_values, w_peer)
-                peer_loss = peer_supervised_loss.mean() + lambda_imitation * imitation_peer
+                peer_loss = peer_supervised_loss.mean() + relay_lambda * imitation_peer
 
                 (loss + peer_loss).backward()
                 optimizer.step()
@@ -311,7 +414,7 @@ def train_one_epoch(
                 peer_weight_source,
                 margin=margin,
             )
-            if lambda_imitation <= 0.0:
+            if relay_lambda <= 0.0:
                 w_student = torch.zeros_like(w_student)
                 w_peer = torch.zeros_like(w_peer)
             elif hetero_ssml_one_way:
@@ -324,25 +427,39 @@ def train_one_epoch(
                 if not peer_imitates:
                     w_peer = torch.zeros_like(w_peer)
 
+            student_hint_target, batch_relay_hotspot_ratio = build_operator_teacher_hint(
+                pred,
+                peer_pred,
+                y,
+                hint_mode=relay_hint_mode,
+                margin=margin,
+            )
             imitation_student_values = (
-                elementwise_imitation_loss_fn(pred, peer_pred)
+                elementwise_imitation_loss_fn(pred, student_hint_target)
                 if operator_weight_granularity == "element"
-                else imitation_loss_fn(pred, peer_pred)
+                else imitation_loss_fn(pred, student_hint_target)
             )
             imitation_term_student = weighted_mean(imitation_student_values, w_student)
-            loss = supervised_loss.mean() + lambda_imitation * imitation_term_student
+            loss = supervised_loss.mean() + relay_lambda * imitation_term_student
 
             if peer_update_disabled:
                 loss.backward()
                 optimizer.step()
             else:
+                peer_hint_target, _ = build_operator_teacher_hint(
+                    peer_pred,
+                    pred,
+                    y,
+                    hint_mode=relay_hint_mode,
+                    margin=margin,
+                )
                 imitation_peer_values = (
-                    elementwise_imitation_loss_fn(peer_pred, pred)
+                    elementwise_imitation_loss_fn(peer_pred, peer_hint_target)
                     if operator_weight_granularity == "element"
-                    else imitation_loss_fn(peer_pred, pred)
+                    else imitation_loss_fn(peer_pred, peer_hint_target)
                 )
                 imitation_term_peer = weighted_mean(imitation_peer_values, w_peer)
-                peer_loss = peer_supervised_loss.mean() + lambda_imitation * imitation_term_peer
+                peer_loss = peer_supervised_loss.mean() + relay_lambda * imitation_term_peer
 
                 (loss + peer_loss).backward()
                 optimizer.step()
@@ -352,8 +469,14 @@ def train_one_epoch(
 
         batch_size = x.size(0)
         total_loss += float(loss.item()) * batch_size
+        total_relay_hotspot_ratio += batch_relay_hotspot_ratio * batch_size
         total_count += batch_size
-    return total_loss / total_count
+    return {
+        "train_mse": total_loss / total_count,
+        "relay_hotspot_ratio": total_relay_hotspot_ratio / total_count,
+        "relay_stage": relay_stage,
+        "relay_scale": relay_scale,
+    }
 
 
 @torch.no_grad()
@@ -419,6 +542,7 @@ def main():
     supervised_elementwise_loss_fn = build_regression_elementwise_loss_fn("mse")
     imitation_loss_fn = build_regression_imitation_loss_fn(args.regression_imitation_loss)
     elementwise_imitation_loss_fn = build_regression_elementwise_loss_fn(args.regression_imitation_loss)
+    relay_stage_epochs = parse_relay_stage_epochs(args.relay_stage_epochs)
 
     run_dir = make_run_dir(
         args.output_dir,
@@ -433,8 +557,15 @@ def main():
         f"granularity={args.operator_weight_granularity} "
         f"student_only={args.ssml_student_only} "
         f"freeze_peer={args.ssml_freeze_peer} "
-        f"peer_updates_disabled={peer_update_disabled}"
+        f"peer_updates_disabled={peer_update_disabled} "
+        f"relay_stage_epochs={relay_stage_epochs} "
+        f"relay_hint_mode={args.relay_hint_mode} "
+        f"relay_taper_schedule={args.relay_taper_schedule}"
     )
+
+    epoch_log_path = Path(run_dir) / "epoch_metrics.jsonl"
+    if epoch_log_path.exists():
+        epoch_log_path.unlink()
 
     train_mse_curve = []
     val_mse_curve = []
@@ -443,6 +574,13 @@ def main():
     peer_val_mae_curve = []
     best_val_mse = float("inf")
     best_peer_val_mse = float("inf")
+    best_stage_val_mse = {
+        "control": float("inf"),
+        "relay": float("inf"),
+        "taper": float("inf"),
+        "finetune": float("inf"),
+        "disabled": float("inf"),
+    }
     hetero_ssml_one_way = args.hetero_ssml_one_way and pair_meta["is_heterogeneous_pair"]
 
     for epoch in range(1, args.epochs + 1):
@@ -455,8 +593,13 @@ def main():
             decay_end_epoch=args.imitation_decay_end_epoch,
             decay_min_scale=args.imitation_decay_min_scale,
         )
+        relay_stage, relay_scale = compute_relay_curriculum(
+            epoch,
+            relay_stage_epochs,
+            args.relay_taper_schedule,
+        )
 
-        tr_mse = train_one_epoch(
+        train_stats = train_one_epoch(
             model,
             peer_model,
             train_loader,
@@ -470,10 +613,14 @@ def main():
             lambda_imitation=effective_lambda,
             margin=args.margin,
             method=args.method,
+            relay_scale=relay_scale,
+            relay_stage=relay_stage,
+            relay_hint_mode=args.relay_hint_mode,
             hetero_ssml_one_way=hetero_ssml_one_way,
             peer_update_disabled=peer_update_disabled,
             operator_weight_granularity=args.operator_weight_granularity,
         )
+        tr_mse = float(train_stats["train_mse"])
         va_mse, va_mae = evaluate(model, val_loader, device)
         peer_va_mse = None
         peer_va_mae = None
@@ -484,19 +631,57 @@ def main():
         val_mse_curve.append(va_mse)
         val_mae_curve.append(va_mae)
         best_val_mse = min(best_val_mse, va_mse)
+        best_stage_val_mse[relay_stage] = min(best_stage_val_mse.get(relay_stage, float("inf")), va_mse)
         if peer_va_mse is not None and peer_va_mae is not None:
             peer_val_mse_curve.append(peer_va_mse)
             peer_val_mae_curve.append(peer_va_mae)
             best_peer_val_mse = min(best_peer_val_mse, peer_va_mse)
 
+        if relay_stage_epochs[0] > 0 and epoch == relay_stage_epochs[0]:
+            torch.save(model.state_dict(), run_dir / "relay_stage0_model.pt")
+            if peer_model is not None:
+                torch.save(peer_model.state_dict(), run_dir / "relay_stage0_peer_model.pt")
+        if relay_stage_epochs[1] > 0 and epoch == relay_stage_epochs[0] + relay_stage_epochs[1]:
+            torch.save(model.state_dict(), run_dir / "relay_stage1_model.pt")
+            if peer_model is not None:
+                torch.save(peer_model.state_dict(), run_dir / "relay_stage1_peer_model.pt")
+
         status = (
             f"[operator][epoch {epoch:03d}] lambda={effective_lambda:.4f} "
+            f"relay_stage={relay_stage} relay_scale={relay_scale:.3f} "
+            f"relay_hotspot={train_stats['relay_hotspot_ratio']:.4f} "
             f"train_mse={tr_mse:.8f} "
             f"val_mse={va_mse:.8f} val_mae={va_mae:.8f}"
         )
         if peer_va_mse is not None and peer_va_mae is not None:
             status += f" | peer_val_mse={peer_va_mse:.8f} peer_val_mae={peer_va_mae:.8f}"
         print(status)
+        append_jsonl(
+            epoch_log_path,
+            {
+                "epoch": epoch,
+                "method": args.method,
+                "dataset": args.dataset,
+                "model": args.model,
+                "peer_model": pair_meta["peer_model"],
+                "lambda_imitation": effective_lambda,
+                "relay_stage": relay_stage,
+                "relay_scale": relay_scale,
+                "relay_stage_epochs": list(relay_stage_epochs),
+                "relay_hint_mode": args.relay_hint_mode,
+                "relay_taper_schedule": args.relay_taper_schedule,
+                "operator_weight_granularity": args.operator_weight_granularity,
+                "hetero_ssml_one_way": hetero_ssml_one_way,
+                "ssml_student_only": args.ssml_student_only,
+                "ssml_freeze_peer": args.ssml_freeze_peer,
+                "train_mse": tr_mse,
+                "relay_hotspot_ratio": train_stats["relay_hotspot_ratio"],
+                "val_mse": va_mse,
+                "val_mae": va_mae,
+                "peer_val_mse": peer_va_mse,
+                "peer_val_mae": peer_va_mae,
+            },
+        )
 
         if epoch % args.live_plot_interval == 0 or epoch == args.epochs:
             save_curves(
@@ -551,6 +736,9 @@ def main():
         "imitation_decay_start_epoch": args.imitation_decay_start_epoch,
         "imitation_decay_end_epoch": args.imitation_decay_end_epoch,
         "imitation_decay_min_scale": args.imitation_decay_min_scale,
+        "relay_stage_epochs": list(relay_stage_epochs),
+        "relay_hint_mode": args.relay_hint_mode,
+        "relay_taper_schedule": args.relay_taper_schedule,
         "hetero_ssml_one_way": hetero_ssml_one_way,
         "ssml_student_only": args.ssml_student_only,
         "ssml_freeze_peer": args.ssml_freeze_peer,
@@ -561,9 +749,14 @@ def main():
         "ssml_directionality": "hetero_weaker_to_stronger_only" if hetero_ssml_one_way else "bidirectional",
         "epochs": args.epochs,
         "seed": args.seed,
+        "epoch_log_path": str(epoch_log_path),
         "best_val_mse": best_val_mse,
         "final_val_mse": val_mse_curve[-1],
         "final_val_mae": val_mae_curve[-1],
+        "best_control_val_mse": None if math.isinf(best_stage_val_mse["control"]) else best_stage_val_mse["control"],
+        "best_relay_val_mse": None if math.isinf(best_stage_val_mse["relay"]) else best_stage_val_mse["relay"],
+        "best_taper_val_mse": None if math.isinf(best_stage_val_mse["taper"]) else best_stage_val_mse["taper"],
+        "best_finetune_val_mse": None if math.isinf(best_stage_val_mse["finetune"]) else best_stage_val_mse["finetune"],
         "best_metric": best_val_mse,
         "best_metric_key": "mse",
         "final_metric": val_mse_curve[-1],
@@ -577,6 +770,8 @@ def main():
         "num_parameters1": count_parameters(model),
         "init_checkpoint": loaded_init_checkpoint,
         "peer_init_checkpoint": loaded_peer_init_checkpoint,
+        "relay_stage0_model_path": str(run_dir / "relay_stage0_model.pt"),
+        "relay_stage1_model_path": str(run_dir / "relay_stage1_model.pt"),
         "meta": meta,
     }
     if peer_model is not None:
