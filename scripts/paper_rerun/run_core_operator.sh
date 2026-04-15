@@ -15,6 +15,10 @@ EPOCHS="${EPOCHS:-150}"
 BATCH_SIZE="${BATCH_SIZE:-16}"
 LR="${LR:-1e-3}"
 WEIGHT_DECAY="${WEIGHT_DECAY:-0.0}"
+LR_SCHEDULER="${LR_SCHEDULER:-none}"
+SCHEDULER_WARMUP_EPOCHS="${SCHEDULER_WARMUP_EPOCHS:-0}"
+SCHEDULER_MIN_SCALE="${SCHEDULER_MIN_SCALE:-0.0}"
+GRAD_CLIP="${GRAD_CLIP:-0.0}"
 NUM_WORKERS="${NUM_WORKERS:-4}"
 DEVICE="${DEVICE:-cuda}"
 OUTPUT_DIR="${OUTPUT_DIR:-$(paper_results_root)/operator}"
@@ -35,13 +39,18 @@ RELAY_TAPER_SCHEDULE="${RELAY_TAPER_SCHEDULE:-linear}"
 INIT_CHECKPOINT_TEMPLATE="${INIT_CHECKPOINT_TEMPLATE:-}"
 PEER_INIT_CHECKPOINT_TEMPLATE="${PEER_INIT_CHECKPOINT_TEMPLATE:-}"
 DOWNLOAD="${DOWNLOAD:-0}"
+SAVE_BEST_CHECKPOINT="${SAVE_BEST_CHECKPOINT:-0}"
+LIVE_PLOT_INTERVAL="${LIVE_PLOT_INTERVAL:-20}"
 
 echo "[operator] output_dir=$OUTPUT_DIR"
 echo "[operator] methods=$METHODS"
 echo "[operator] model_pairs=$MODEL_PAIRS"
+echo "[operator] lr=$LR weight_decay=$WEIGHT_DECAY lr_scheduler=$LR_SCHEDULER"
+echo "[operator] scheduler_warmup_epochs=$SCHEDULER_WARMUP_EPOCHS scheduler_min_scale=$SCHEDULER_MIN_SCALE grad_clip=$GRAD_CLIP"
 echo "[operator] relay_stage_epochs=$RELAY_STAGE_EPOCHS"
 echo "[operator] relay_hint_mode=$RELAY_HINT_MODE"
 echo "[operator] relay_taper_schedule=$RELAY_TAPER_SCHEDULE"
+echo "[operator] save_best_checkpoint=$SAVE_BEST_CHECKPOINT live_plot_interval=$LIVE_PLOT_INTERVAL"
 
 for dataset in $DATASETS; do
   for method in $METHODS; do
@@ -57,6 +66,10 @@ for dataset in $DATASETS; do
             --batch-size "$BATCH_SIZE"
             --lr "$LR"
             --weight-decay "$WEIGHT_DECAY"
+            --lr-scheduler "$LR_SCHEDULER"
+            --scheduler-warmup-epochs "$SCHEDULER_WARMUP_EPOCHS"
+            --scheduler-min-scale "$SCHEDULER_MIN_SCALE"
+            --grad-clip "$GRAD_CLIP"
             --num-workers "$NUM_WORKERS"
             --seed "$seed"
             --device "$DEVICE"
@@ -72,6 +85,7 @@ for dataset in $DATASETS; do
             --relay-stage-epochs "$RELAY_STAGE_EPOCHS"
             --relay-hint-mode "$RELAY_HINT_MODE"
             --relay-taper-schedule "$RELAY_TAPER_SCHEDULE"
+            --live-plot-interval "$LIVE_PLOT_INTERVAL"
           )
 
           init_checkpoint="${INIT_CHECKPOINT_TEMPLATE//\{seed\}/$seed}"
@@ -84,6 +98,9 @@ for dataset in $DATASETS; do
           fi
           if [[ -n "$init_checkpoint" ]]; then
             cmd+=(--init-checkpoint "$init_checkpoint")
+          fi
+          if [[ "$SAVE_BEST_CHECKPOINT" == "1" ]]; then
+            cmd+=(--save-best-checkpoint)
           fi
 
           echo "[operator] dataset=$dataset model=$MODEL method=$method seed=$seed"
@@ -111,6 +128,10 @@ for dataset in $DATASETS; do
           --batch-size "$BATCH_SIZE"
           --lr "$LR"
           --weight-decay "$WEIGHT_DECAY"
+          --lr-scheduler "$LR_SCHEDULER"
+          --scheduler-warmup-epochs "$SCHEDULER_WARMUP_EPOCHS"
+          --scheduler-min-scale "$SCHEDULER_MIN_SCALE"
+          --grad-clip "$GRAD_CLIP"
           --num-workers "$NUM_WORKERS"
           --seed "$seed"
           --device "$DEVICE"
@@ -126,6 +147,7 @@ for dataset in $DATASETS; do
           --relay-stage-epochs "$RELAY_STAGE_EPOCHS"
           --relay-hint-mode "$RELAY_HINT_MODE"
           --relay-taper-schedule "$RELAY_TAPER_SCHEDULE"
+          --live-plot-interval "$LIVE_PLOT_INTERVAL"
         )
 
         init_checkpoint="${INIT_CHECKPOINT_TEMPLATE//\{seed\}/$seed}"
@@ -148,6 +170,9 @@ for dataset in $DATASETS; do
         fi
         if [[ -n "$peer_init_checkpoint" ]]; then
           cmd+=(--peer-init-checkpoint "$peer_init_checkpoint")
+        fi
+        if [[ "$SAVE_BEST_CHECKPOINT" == "1" ]]; then
+          cmd+=(--save-best-checkpoint)
         fi
 
         echo "[operator] dataset=$dataset pair=$MODEL:$PEER_MODEL method=$method seed=$seed"

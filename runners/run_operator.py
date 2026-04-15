@@ -56,6 +56,10 @@ def parse_args():
     p.add_argument("--batch-size", type=int, default=16)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--weight-decay", type=float, default=0.0)
+    p.add_argument("--lr-scheduler", type=str, default="none", choices=["none", "cosine"])
+    p.add_argument("--scheduler-warmup-epochs", type=int, default=0)
+    p.add_argument("--scheduler-min-scale", type=float, default=0.0)
+    p.add_argument("--grad-clip", type=float, default=0.0)
     p.add_argument("--num-workers", type=int, default=0)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", type=str, default="cuda")
@@ -77,6 +81,7 @@ def parse_args():
     p.add_argument("--relay-taper-schedule", type=str, default="linear", choices=["linear", "cosine", "constant"])
     p.add_argument("--init-checkpoint", type=str, default=None)
     p.add_argument("--peer-init-checkpoint", type=str, default=None)
+    p.add_argument("--save-best-checkpoint", action="store_true")
     p.add_argument("--live-plot-interval", type=int, default=20)
     return p.parse_args()
 
@@ -171,6 +176,61 @@ def compute_effective_lambda(
     progress = (epoch - decay_start_epoch) / max(decay_end_epoch - decay_start_epoch, 1)
     scale = 1.0 + (decay_min_scale - 1.0) * progress
     return base_lambda * scale
+
+
+def compute_epoch_lr(
+    base_lr: float,
+    *,
+    epoch: int,
+    total_epochs: int,
+    scheduler_name: str,
+    warmup_epochs: int,
+    min_scale: float,
+) -> float:
+    if scheduler_name == "none":
+        return float(base_lr)
+
+    if scheduler_name != "cosine":
+        raise ValueError(f"Unsupported lr scheduler: {scheduler_name}")
+
+    total_epochs = max(int(total_epochs), 1)
+    warmup_epochs = max(0, min(int(warmup_epochs), total_epochs))
+    min_scale = float(max(0.0, min(float(min_scale), 1.0)))
+
+    if warmup_epochs > 0 and epoch <= warmup_epochs:
+        return float(base_lr) * (float(epoch) / float(max(warmup_epochs, 1)))
+
+    cosine_epochs = max(total_epochs - warmup_epochs, 1)
+    if cosine_epochs == 1:
+        progress = 0.0
+    else:
+        progress = (epoch - warmup_epochs - 1) / max(cosine_epochs - 1, 1)
+    progress = float(max(0.0, min(1.0, progress)))
+    cosine_scale = 0.5 * (1.0 + math.cos(math.pi * progress))
+    scale = min_scale + (1.0 - min_scale) * cosine_scale
+    return float(base_lr) * scale
+
+
+def set_optimizer_lr(optimizer: Optional[torch.optim.Optimizer], lr: float) -> None:
+    if optimizer is None:
+        return
+    for group in optimizer.param_groups:
+        group["lr"] = lr
+
+
+def get_optimizer_lr(optimizer: Optional[torch.optim.Optimizer]) -> Optional[float]:
+    if optimizer is None or not optimizer.param_groups:
+        return None
+    return float(optimizer.param_groups[0]["lr"])
+
+
+def clip_model_gradients(model: Optional[torch.nn.Module], max_norm: float) -> None:
+    if model is None or max_norm <= 0.0:
+        return
+    params = [param for param in model.parameters() if param.requires_grad and param.grad is not None]
+    if not params:
+        return
+    torch.nn.utils.clip_grad_norm_(params, max_norm)
 
 
 def parse_relay_stage_epochs(spec: str) -> tuple[int, int, int]:
@@ -296,6 +356,7 @@ def train_one_epoch(
     hetero_ssml_one_way: bool = False,
     peer_update_disabled: bool = False,
     operator_weight_granularity: str = "sample",
+    grad_clip: float = 0.0,
 ):
     method = canonicalize_method_name(method)
     model.train()
@@ -326,6 +387,7 @@ def train_one_epoch(
         if method == "independent":
             loss = supervised_loss.mean()
             loss.backward()
+            clip_model_gradients(model, grad_clip)
             optimizer.step()
 
         elif method == "dml":
@@ -371,6 +433,7 @@ def train_one_epoch(
             loss = supervised_loss.mean() + relay_lambda * imitation_student
             if peer_update_disabled:
                 loss.backward()
+                clip_model_gradients(model, grad_clip)
                 optimizer.step()
             else:
                 peer_hint_target, _ = build_operator_teacher_hint(
@@ -389,6 +452,8 @@ def train_one_epoch(
                 peer_loss = peer_supervised_loss.mean() + relay_lambda * imitation_peer
 
                 (loss + peer_loss).backward()
+                clip_model_gradients(model, grad_clip)
+                clip_model_gradients(peer_model, grad_clip)
                 optimizer.step()
                 peer_optimizer.step()
 
@@ -444,6 +509,7 @@ def train_one_epoch(
 
             if peer_update_disabled:
                 loss.backward()
+                clip_model_gradients(model, grad_clip)
                 optimizer.step()
             else:
                 peer_hint_target, _ = build_operator_teacher_hint(
@@ -462,6 +528,8 @@ def train_one_epoch(
                 peer_loss = peer_supervised_loss.mean() + relay_lambda * imitation_term_peer
 
                 (loss + peer_loss).backward()
+                clip_model_gradients(model, grad_clip)
+                clip_model_gradients(peer_model, grad_clip)
                 optimizer.step()
                 peer_optimizer.step()
         else:
@@ -554,6 +622,11 @@ def main():
     print(f"[operator] params={count_parameters(model)}")
     print(
         "[operator] "
+        f"lr_scheduler={args.lr_scheduler} "
+        f"scheduler_warmup_epochs={args.scheduler_warmup_epochs} "
+        f"scheduler_min_scale={args.scheduler_min_scale:.4f} "
+        f"grad_clip={args.grad_clip:.4f} "
+        f"save_best_checkpoint={args.save_best_checkpoint} "
         f"granularity={args.operator_weight_granularity} "
         f"student_only={args.ssml_student_only} "
         f"freeze_peer={args.ssml_freeze_peer} "
@@ -573,7 +646,9 @@ def main():
     peer_val_mse_curve = []
     peer_val_mae_curve = []
     best_val_mse = float("inf")
+    best_epoch = None
     best_peer_val_mse = float("inf")
+    best_peer_epoch = None
     best_stage_val_mse = {
         "control": float("inf"),
         "relay": float("inf"),
@@ -582,8 +657,34 @@ def main():
         "disabled": float("inf"),
     }
     hetero_ssml_one_way = args.hetero_ssml_one_way and pair_meta["is_heterogeneous_pair"]
+    best_model_path = run_dir / "best_model.pt"
+    best_peer_model_path = run_dir / "best_peer_model.pt"
+    last_current_lr = get_optimizer_lr(optimizer)
+    last_current_peer_lr = get_optimizer_lr(peer_optimizer)
 
     for epoch in range(1, args.epochs + 1):
+        current_lr = compute_epoch_lr(
+            args.lr,
+            epoch=epoch,
+            total_epochs=args.epochs,
+            scheduler_name=args.lr_scheduler,
+            warmup_epochs=args.scheduler_warmup_epochs,
+            min_scale=args.scheduler_min_scale,
+        )
+        set_optimizer_lr(optimizer, current_lr)
+        current_peer_lr = None
+        if peer_optimizer is not None:
+            current_peer_lr = compute_epoch_lr(
+                args.lr,
+                epoch=epoch,
+                total_epochs=args.epochs,
+                scheduler_name=args.lr_scheduler,
+                warmup_epochs=args.scheduler_warmup_epochs,
+                min_scale=args.scheduler_min_scale,
+            )
+            set_optimizer_lr(peer_optimizer, current_peer_lr)
+        last_current_lr = current_lr
+        last_current_peer_lr = current_peer_lr
         effective_lambda = compute_effective_lambda(
             args.lambda_imitation,
             epoch=epoch,
@@ -619,6 +720,7 @@ def main():
             hetero_ssml_one_way=hetero_ssml_one_way,
             peer_update_disabled=peer_update_disabled,
             operator_weight_granularity=args.operator_weight_granularity,
+            grad_clip=args.grad_clip,
         )
         tr_mse = float(train_stats["train_mse"])
         va_mse, va_mae = evaluate(model, val_loader, device)
@@ -630,12 +732,20 @@ def main():
         train_mse_curve.append(tr_mse)
         val_mse_curve.append(va_mse)
         val_mae_curve.append(va_mae)
-        best_val_mse = min(best_val_mse, va_mse)
+        if va_mse < best_val_mse:
+            best_val_mse = va_mse
+            best_epoch = epoch
+            if args.save_best_checkpoint:
+                torch.save(model.state_dict(), best_model_path)
         best_stage_val_mse[relay_stage] = min(best_stage_val_mse.get(relay_stage, float("inf")), va_mse)
         if peer_va_mse is not None and peer_va_mae is not None:
             peer_val_mse_curve.append(peer_va_mse)
             peer_val_mae_curve.append(peer_va_mae)
-            best_peer_val_mse = min(best_peer_val_mse, peer_va_mse)
+            if peer_va_mse < best_peer_val_mse:
+                best_peer_val_mse = peer_va_mse
+                best_peer_epoch = epoch
+                if args.save_best_checkpoint:
+                    torch.save(peer_model.state_dict(), best_peer_model_path)
 
         if relay_stage_epochs[0] > 0 and epoch == relay_stage_epochs[0]:
             torch.save(model.state_dict(), run_dir / "relay_stage0_model.pt")
@@ -647,7 +757,8 @@ def main():
                 torch.save(peer_model.state_dict(), run_dir / "relay_stage1_peer_model.pt")
 
         status = (
-            f"[operator][epoch {epoch:03d}] lambda={effective_lambda:.4f} "
+            f"[operator][epoch {epoch:03d}] lr={current_lr:.6g} "
+            f"lambda={effective_lambda:.4f} "
             f"relay_stage={relay_stage} relay_scale={relay_scale:.3f} "
             f"relay_hotspot={train_stats['relay_hotspot_ratio']:.4f} "
             f"train_mse={tr_mse:.8f} "
@@ -664,6 +775,10 @@ def main():
                 "dataset": args.dataset,
                 "model": args.model,
                 "peer_model": pair_meta["peer_model"],
+                "current_lr": current_lr,
+                "current_peer_lr": current_peer_lr,
+                "best_epoch_so_far": best_epoch,
+                "best_peer_epoch_so_far": best_peer_epoch,
                 "lambda_imitation": effective_lambda,
                 "relay_stage": relay_stage,
                 "relay_scale": relay_scale,
@@ -730,6 +845,15 @@ def main():
         "model1": args.model,
         "model2": pair_meta["peer_model"],
         "regression_imitation_loss": args.regression_imitation_loss,
+        "lr": args.lr,
+        "weight_decay": args.weight_decay,
+        "lr_scheduler": args.lr_scheduler,
+        "scheduler_warmup_epochs": args.scheduler_warmup_epochs,
+        "scheduler_min_scale": args.scheduler_min_scale,
+        "grad_clip": args.grad_clip,
+        "save_best_checkpoint": args.save_best_checkpoint,
+        "current_lr": last_current_lr,
+        "current_peer_lr": last_current_peer_lr,
         "lambda_imitation": args.lambda_imitation,
         "margin": args.margin,
         "warmup_epochs": args.warmup_epochs,
@@ -751,8 +875,11 @@ def main():
         "seed": args.seed,
         "epoch_log_path": str(epoch_log_path),
         "best_val_mse": best_val_mse,
+        "best_epoch": best_epoch,
+        "best_model_path": str(best_model_path) if args.save_best_checkpoint else None,
         "final_val_mse": val_mse_curve[-1],
         "final_val_mae": val_mae_curve[-1],
+        "best_final_gap": val_mse_curve[-1] - best_val_mse,
         "best_control_val_mse": None if math.isinf(best_stage_val_mse["control"]) else best_stage_val_mse["control"],
         "best_relay_val_mse": None if math.isinf(best_stage_val_mse["relay"]) else best_stage_val_mse["relay"],
         "best_taper_val_mse": None if math.isinf(best_stage_val_mse["taper"]) else best_stage_val_mse["taper"],
@@ -778,11 +905,15 @@ def main():
         summary.update(
             {
                 "best_metric2": best_peer_val_mse,
+                "best_peer_epoch": best_peer_epoch,
+                "best_epoch2": best_peer_epoch,
+                "best_peer_model_path": str(best_peer_model_path) if args.save_best_checkpoint else None,
                 "final_metric2": peer_val_mse_curve[-1],
                 "best_val_mse2": best_peer_val_mse,
                 "final_val_mse2": peer_val_mse_curve[-1],
                 "final_val_mae2": peer_val_mae_curve[-1],
                 "final_val2": peer_val_mse_curve[-1],
+                "peer_best_final_gap": peer_val_mse_curve[-1] - best_peer_val_mse,
                 "num_parameters2": count_parameters(peer_model),
             }
         )

@@ -106,6 +106,7 @@ def _build_resnet(
     num_classes: int,
     in_channels: int,
     activation: str = "relu",
+    cifar_stem: bool = False,
 ) -> nn.Module:
     if depth == 18:
         model = tv_models.resnet18(weights=None, num_classes=num_classes)
@@ -113,7 +114,17 @@ def _build_resnet(
         model = tv_models.resnet34(weights=None, num_classes=num_classes)
     else:
         raise ValueError(f"Unsupported ResNet depth: {depth}")
-    if in_channels != 3:
+    if cifar_stem:
+        model.conv1 = nn.Conv2d(
+            in_channels,
+            64,
+            kernel_size=3,
+            stride=1,
+            padding=1,
+            bias=False,
+        )
+        model.maxpool = nn.Identity()
+    elif in_channels != 3:
         model.conv1 = nn.Conv2d(
             in_channels,
             64,
@@ -158,6 +169,24 @@ def build_classification_model(
     if name == "resnet34_gelu":
         return _build_resnet(34, num_classes=num_classes, in_channels=in_channels, activation="gelu")
 
+    if name == "resnet34_cifar":
+        return _build_resnet(
+            34,
+            num_classes=num_classes,
+            in_channels=in_channels,
+            activation="relu",
+            cifar_stem=True,
+        )
+
+    if name == "resnet34_cifar_gelu":
+        return _build_resnet(
+            34,
+            num_classes=num_classes,
+            in_channels=in_channels,
+            activation="gelu",
+            cifar_stem=True,
+        )
+
     if name in {"vit_b16", "vit"}:
         # image_size must be divisible by patch_size(16)
         if image_size % 16 != 0:
@@ -180,5 +209,6 @@ def build_classification_model(
 
     raise ValueError(
         f"Unsupported classification model '{model_name}'. "
-        "Use one of: simple_cnn, simple_mlp, ode_cnn, resnet18, resnet18_gelu, resnet34, resnet34_gelu, vit_b16"
+        "Use one of: simple_cnn, simple_mlp, ode_cnn, resnet18, resnet18_gelu, resnet34, "
+        "resnet34_gelu, resnet34_cifar, resnet34_cifar_gelu, vit_b16"
     )

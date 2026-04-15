@@ -55,6 +55,7 @@ run_case() {
       REGRESSION_IMITATION_LOSS="$REGRESSION_IMITATION_LOSS" \
       FEATURE_MODE="$FEATURE_MODE" \
       SSML_GUIDANCE_MODE="reweight_only" \
+      SSML_EVAL_OUTPUT_MODE="${SSML_EVAL_OUTPUT_MODE:-best_branch}" \
       SSML_STUDENT_ONLY="1" \
       SSML_FREEZE_PEER="1" \
       SSML_TOPK_SCOPE="positive" \

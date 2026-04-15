@@ -1,0 +1,51 @@
+[
+  {
+    "case": "node0_gpu0",
+    "completed": false,
+    "missing_seeds": [
+      1,
+      2
+    ],
+    "count": 1,
+    "mean": 0.5523000118255615,
+    "std": 0.0,
+    "gap_to_current_best": 0.015733011825561527,
+    "gap_to_strongest_baseline": 0.007233011825561575
+  },
+  {
+    "case": "node0_gpu1",
+    "completed": false,
+    "missing_seeds": [
+      1,
+      2
+    ],
+    "count": 1,
+    "mean": 0.551300012588501,
+    "std": 0.0,
+    "gap_to_current_best": 0.014733012588501015,
+    "gap_to_strongest_baseline": 0.006233012588501063
+  },
+  {
+    "case": "worker3_gpu0",
+    "completed": true,
+    "missing_seeds": [],
+    "count": 3,
+    "mean": 0.5500666912396749,
+    "std": 0.005430972161782694,
+    "gap_to_current_best": 0.013499691239674871,
+    "gap_to_strongest_baseline": 0.004999691239674919
+  },
+  {
+    "case": "smoke_worker3_gpu0",
+    "completed": false,
+    "missing_seeds": [
+      1,
+      2
+    ],
+    "count": 1,
+    "mean": 0.5470000189781189,
+    "std": 0.0,
+    "gap_to_current_best": 0.01043301897811888,
+    "gap_to_strongest_baseline": 0.0019330189781189278
+  }
+]

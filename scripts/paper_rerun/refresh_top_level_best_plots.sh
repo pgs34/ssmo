@@ -14,6 +14,7 @@ echo "[refresh_top_level_best_plots] out_dir=$OUT_DIR"
 python scripts/paper_rerun/generate_top_level_best_plots.py
 
 cp -f "$OUT_DIR/test_error_classification.png" "$MIRROR_DIR/classification_best.png"
+cp -f "$OUT_DIR/test_error_cifar100_only.png" "$MIRROR_DIR/cifar100_only_best.png"
 cp -f "$OUT_DIR/test_error_time_series.png" "$MIRROR_DIR/time_series_best.png"
 cp -f "$OUT_DIR/test_error_operator.png" "$MIRROR_DIR/operator_best.png"
 

@@ -18,6 +18,7 @@ class ClassificationDataConfig:
     pin_memory: bool = True
     download: bool = True
     train_augment: bool = True
+    train_aug_mode: str = "basic"
     train_subset_size: Optional[int] = None
     val_subset_size: Optional[int] = None
     seed: int = 0
@@ -90,6 +91,7 @@ def build_classification_dataloaders(config: ClassificationDataConfig):
 
 def _build_base_datasets(config: ClassificationDataConfig):
     name = config.dataset_name.lower()
+    train_aug_mode = config.train_aug_mode.lower().strip()
     if name == "mnist":
         mean, std = (0.1307,), (0.3081,)
         train_tf = [transforms.Resize((32, 32)), transforms.ToTensor(), transforms.Normalize(mean, std)]
@@ -119,12 +121,26 @@ def _build_base_datasets(config: ClassificationDataConfig):
         mean, std = (0.4914, 0.4822, 0.4465), (0.2470, 0.2435, 0.2616)
         train_tf = [transforms.ToTensor(), transforms.Normalize(mean, std)]
         if config.train_augment:
-            train_tf = [
-                transforms.RandomCrop(32, padding=4),
-                transforms.RandomHorizontalFlip(),
-                transforms.ToTensor(),
-                transforms.Normalize(mean, std),
-            ]
+            if train_aug_mode == "strong":
+                train_tf = [
+                    transforms.RandomCrop(32, padding=4),
+                    transforms.RandomHorizontalFlip(),
+                    transforms.RandAugment(num_ops=2, magnitude=9),
+                    transforms.ToTensor(),
+                    transforms.Normalize(mean, std),
+                    transforms.RandomErasing(
+                        p=0.25,
+                        scale=(0.02, 0.2),
+                        ratio=(0.3, 3.3),
+                    ),
+                ]
+            else:
+                train_tf = [
+                    transforms.RandomCrop(32, padding=4),
+                    transforms.RandomHorizontalFlip(),
+                    transforms.ToTensor(),
+                    transforms.Normalize(mean, std),
+                ]
         test_tf = [transforms.ToTensor(), transforms.Normalize(mean, std)]
         train_set = datasets.CIFAR10(
             root=config.data_root,
@@ -144,12 +160,26 @@ def _build_base_datasets(config: ClassificationDataConfig):
         mean, std = (0.5071, 0.4867, 0.4408), (0.2675, 0.2565, 0.2761)
         train_tf = [transforms.ToTensor(), transforms.Normalize(mean, std)]
         if config.train_augment:
-            train_tf = [
-                transforms.RandomCrop(32, padding=4),
-                transforms.RandomHorizontalFlip(),
-                transforms.ToTensor(),
-                transforms.Normalize(mean, std),
-            ]
+            if train_aug_mode == "strong":
+                train_tf = [
+                    transforms.RandomCrop(32, padding=4),
+                    transforms.RandomHorizontalFlip(),
+                    transforms.RandAugment(num_ops=2, magnitude=9),
+                    transforms.ToTensor(),
+                    transforms.Normalize(mean, std),
+                    transforms.RandomErasing(
+                        p=0.25,
+                        scale=(0.02, 0.2),
+                        ratio=(0.3, 3.3),
+                    ),
+                ]
+            else:
+                train_tf = [
+                    transforms.RandomCrop(32, padding=4),
+                    transforms.RandomHorizontalFlip(),
+                    transforms.ToTensor(),
+                    transforms.Normalize(mean, std),
+                ]
         test_tf = [transforms.ToTensor(), transforms.Normalize(mean, std)]
         train_set = datasets.CIFAR100(
             root=config.data_root,

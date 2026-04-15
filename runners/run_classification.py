@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import math
 import os
 import socket
@@ -34,6 +35,8 @@ CLASSIFICATION_MODEL_CHOICES = [
     "resnet18_gelu",
     "resnet34",
     "resnet34_gelu",
+    "resnet34_cifar",
+    "resnet34_cifar_gelu",
     "vit_b16",
 ]
 CLASSIFICATION_METHOD_CHOICES = ["independent", "dml", "ssml"]
@@ -92,11 +95,22 @@ def parse_args():
     p.add_argument("--batch-size", type=int, default=128)
     p.add_argument("--lr", type=float, default=1e-3)
     p.add_argument("--weight-decay", type=float, default=1e-4)
+    p.add_argument("--optimizer", type=str, default="adamw", choices=["adamw", "sgd_nesterov"])
+    p.add_argument("--momentum", type=float, default=0.9)
+    p.add_argument("--lr-scheduler", type=str, default="none", choices=["none", "cosine"])
+    p.add_argument("--scheduler-warmup-epochs", type=int, default=0)
+    p.add_argument("--scheduler-min-scale", type=float, default=0.0)
+    p.add_argument("--label-smoothing", type=float, default=0.0)
+    p.add_argument("--grad-clip", type=float, default=0.0)
+    p.add_argument("--model-ema-decay", type=float, default=0.0)
     p.add_argument("--num-workers", type=int, default=4)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--device", type=str, default="cuda")
     p.add_argument("--output-dir", type=str, default="results/experiments")
+    p.add_argument("--protocol-id", type=str, default="default")
+    p.add_argument("--hardware-profile", type=str, default="")
     p.add_argument("--download", action="store_true")
+    p.add_argument("--train-aug-mode", type=str, default="basic", choices=["basic", "strong"])
     p.add_argument("--train-subset-size", type=int, default=None)
     p.add_argument("--val-subset-size", type=int, default=None)
     p.add_argument("--label-noise-type", type=str, default=None, choices=[None, "symmetric", "asymmetric"])
@@ -110,12 +124,17 @@ def parse_args():
     p.add_argument("--imitation-decay-end-epoch", type=int, default=-1)
     p.add_argument("--imitation-decay-min-scale", type=float, default=1.0)
     p.add_argument("--freeze-bn-stats", action="store_true")
+    p.add_argument("--freeze-bn-stats-until-epoch", type=int, default=-1)
     p.add_argument("--hetero-ssml-one-way", action="store_true")
     p.add_argument("--ssml-student-only", action="store_true")
     p.add_argument("--ssml-freeze-peer", action="store_true")
     p.add_argument("--ssml-worse-only-update", action="store_true")
     p.add_argument("--ssml-anchor-weight", type=float, default=0.0)
     p.add_argument("--ssml-topk-ratio", type=float, default=0.3)
+    p.add_argument("--ssml-topk-ratio-start", type=float, default=None)
+    p.add_argument("--ssml-topk-ratio-end", type=float, default=None)
+    p.add_argument("--ssml-topk-ramp-start-epoch", type=int, default=-1)
+    p.add_argument("--ssml-topk-ramp-end-epoch", type=int, default=-1)
     p.add_argument("--ssml-topk-scope", type=str, default="total", choices=["total", "positive"])
     p.add_argument("--ssml-supervised-hotspot-alpha", type=float, default=0.0)
     p.add_argument(
@@ -159,8 +178,17 @@ def parse_args():
     p.add_argument("--ssml-disagreement-floor-ratio", type=float, default=0.0)
     p.add_argument("--ssml-deficit-ema-momentum", type=float, default=0.0)
     p.add_argument("--ssml-extra-class-budget-scale", type=float, default=0.0)
+    p.add_argument("--ssml-complement-ramp-start-epoch", type=int, default=-1)
+    p.add_argument("--ssml-complement-ramp-end-epoch", type=int, default=-1)
+    p.add_argument("--ssml-secondary-peer-init-checkpoint", type=str, default=None)
+    p.add_argument("--ssml-secondary-peer-require-same-label", action="store_true")
+    p.add_argument("--ssml-secondary-peer-agreement-min", type=float, default=0.0)
     p.add_argument("--ssml-peer-true-prob-threshold", type=float, default=0.0)
+    p.add_argument("--ssml-peer-true-prob-threshold-start", type=float, default=None)
+    p.add_argument("--ssml-peer-true-prob-threshold-end", type=float, default=None)
     p.add_argument("--ssml-peer-student-prob-gap-min", type=float, default=0.0)
+    p.add_argument("--ssml-peer-student-prob-gap-min-start", type=float, default=None)
+    p.add_argument("--ssml-peer-student-prob-gap-min-end", type=float, default=None)
     p.add_argument("--ssml-aug-consistency-weight", type=float, default=0.0)
     p.add_argument("--ssml-aug-consistency-shift", type=int, default=0)
     p.add_argument("--ssml-aug-consistency-flip-prob", type=float, default=0.0)
@@ -172,6 +200,78 @@ def parse_args():
     p.add_argument("--peer-init-checkpoint", type=str, default=None)
     p.add_argument("--live-plot-interval", type=int, default=20)
     return p.parse_args()
+
+
+def clone_ema_model(model: torch.nn.Module) -> torch.nn.Module:
+    ema_model = copy.deepcopy(model)
+    ema_model.eval()
+    for param in ema_model.parameters():
+        param.requires_grad_(False)
+    return ema_model
+
+
+@torch.no_grad()
+def update_ema_model(ema_model: Optional[torch.nn.Module], online_model: torch.nn.Module, decay: float) -> None:
+    if ema_model is None or decay <= 0.0:
+        return
+    for ema_param, online_param in zip(ema_model.parameters(), online_model.parameters()):
+        ema_param.mul_(decay).add_(online_param.detach(), alpha=1.0 - decay)
+    for ema_buffer, online_buffer in zip(ema_model.buffers(), online_model.buffers()):
+        ema_buffer.copy_(online_buffer)
+
+
+def compute_epoch_lr(
+    base_lr: float,
+    *,
+    epoch: int,
+    total_epochs: int,
+    scheduler_name: str,
+    warmup_epochs: int,
+    min_scale: float,
+) -> float:
+    if scheduler_name == "none":
+        return float(base_lr)
+    if scheduler_name != "cosine":
+        raise ValueError(f"Unsupported lr scheduler: {scheduler_name}")
+
+    total_epochs = max(int(total_epochs), 1)
+    warmup_epochs = max(0, min(int(warmup_epochs), total_epochs))
+    min_scale = float(max(0.0, min(float(min_scale), 1.0)))
+
+    if warmup_epochs > 0 and epoch <= warmup_epochs:
+        return float(base_lr) * (float(epoch) / float(max(warmup_epochs, 1)))
+
+    cosine_epochs = max(total_epochs - warmup_epochs, 1)
+    if cosine_epochs == 1:
+        progress = 0.0
+    else:
+        progress = (epoch - warmup_epochs - 1) / max(cosine_epochs - 1, 1)
+    progress = float(max(0.0, min(1.0, progress)))
+    cosine_scale = 0.5 * (1.0 + math.cos(math.pi * progress))
+    scale = min_scale + (1.0 - min_scale) * cosine_scale
+    return float(base_lr) * scale
+
+
+def set_optimizer_lr(optimizer: Optional[torch.optim.Optimizer], lr: float) -> None:
+    if optimizer is None:
+        return
+    for group in optimizer.param_groups:
+        group["lr"] = lr
+
+
+def get_optimizer_lr(optimizer: Optional[torch.optim.Optimizer]) -> Optional[float]:
+    if optimizer is None or not optimizer.param_groups:
+        return None
+    return float(optimizer.param_groups[0]["lr"])
+
+
+def clip_model_gradients(model: Optional[torch.nn.Module], max_norm: float) -> None:
+    if model is None or max_norm <= 0.0:
+        return
+    params = [param for param in model.parameters() if param.requires_grad and param.grad is not None]
+    if not params:
+        return
+    torch.nn.utils.clip_grad_norm_(params, max_norm)
 
 
 def accuracy(logits: torch.Tensor, targets: torch.Tensor) -> float:
@@ -253,7 +353,9 @@ def compute_augmented_consistency_scores(
     max_shift: int,
     flip_prob: float,
     noise_std: float,
-) -> tuple[torch.Tensor, torch.Tensor]:
+    secondary_model: Optional[torch.nn.Module] = None,
+    secondary_prob_dist: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
     augmented_x = apply_batch_consistency_augmentation(
         x,
         max_shift=max_shift,
@@ -262,11 +364,19 @@ def compute_augmented_consistency_scores(
     )
     student_was_training = model.training
     peer_was_training = peer_model.training
+    secondary_was_training = secondary_model.training if secondary_model is not None else False
     model.eval()
     peer_model.eval()
+    if secondary_model is not None:
+        secondary_model.eval()
     with torch.no_grad():
         student_aug_prob = F.softmax(model(augmented_x), dim=1)
         peer_aug_prob = F.softmax(peer_model(augmented_x), dim=1)
+        secondary_aug_prob = (
+            F.softmax(secondary_model(augmented_x), dim=1)
+            if secondary_model is not None
+            else None
+        )
     if student_was_training:
         model.train()
     else:
@@ -275,9 +385,18 @@ def compute_augmented_consistency_scores(
         peer_model.train()
     else:
         peer_model.eval()
+    if secondary_model is not None:
+        if secondary_was_training:
+            secondary_model.train()
+        else:
+            secondary_model.eval()
+    secondary_consistency = None
+    if secondary_aug_prob is not None and secondary_prob_dist is not None:
+        secondary_consistency = compute_probability_consistency(secondary_prob_dist, secondary_aug_prob)
     return (
         compute_probability_consistency(student_prob_dist, student_aug_prob),
         compute_probability_consistency(peer_prob_dist, peer_aug_prob),
+        secondary_consistency,
     )
 
 
@@ -575,6 +694,49 @@ def build_deficit_adjusted_class_budgets(
         scale = torch.clamp(scale, min=0.25)
         budgets = budgets * scale
     return torch.clamp(budgets.round(), min=1.0).to(dtype=torch.long)
+
+
+def compute_epoch_ramp_scale(
+    *,
+    epoch: int,
+    start_epoch: int,
+    end_epoch: int,
+) -> float:
+    if start_epoch < 0 or end_epoch < 0:
+        return 1.0
+    start_epoch = max(int(start_epoch), 0)
+    end_epoch = max(int(end_epoch), 0)
+    if end_epoch <= start_epoch:
+        return 0.0 if epoch < start_epoch else 1.0
+    if epoch <= start_epoch:
+        return 0.0
+    if epoch >= end_epoch:
+        return 1.0
+    progress = (epoch - start_epoch) / max(end_epoch - start_epoch, 1)
+    return float(max(0.0, min(1.0, progress)))
+
+
+def compute_scheduled_scalar(
+    *,
+    epoch: int,
+    start_value: Optional[float],
+    end_value: Optional[float],
+    ramp_start_epoch: int,
+    ramp_end_epoch: int,
+    fallback_value: float,
+) -> float:
+    if start_value is None and end_value is None:
+        return float(fallback_value)
+    if start_value is None:
+        start_value = float(fallback_value)
+    if end_value is None:
+        end_value = float(fallback_value)
+    ramp_scale = compute_epoch_ramp_scale(
+        epoch=epoch,
+        start_epoch=ramp_start_epoch,
+        end_epoch=ramp_end_epoch,
+    )
+    return float(start_value) + (float(end_value) - float(start_value)) * float(ramp_scale)
 
 
 @torch.no_grad()
@@ -916,6 +1078,7 @@ def choose_one_way_imitation_from_scores(
 def train_one_epoch(
     model,
     peer_model: Optional[torch.nn.Module],
+    secondary_peer_model: Optional[torch.nn.Module],
     loader,
     optimizer,
     peer_optimizer: Optional[torch.optim.Optimizer],
@@ -923,6 +1086,11 @@ def train_one_epoch(
     supervised_loss_fn: Callable[..., torch.Tensor],
     imitation_loss_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
     ssml_elementwise_imitation_loss_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor],
+    label_smoothing: float,
+    grad_clip: float,
+    ema_model: Optional[torch.nn.Module],
+    ema_peer_model: Optional[torch.nn.Module],
+    model_ema_decay: float,
     lambda_imitation: float,
     margin: float,
     ssml_topk_ratio: float,
@@ -940,6 +1108,9 @@ def train_one_epoch(
     num_classes: int,
     ssml_dynamic_per_class_budget: Optional[torch.Tensor],
     ssml_disagreement_floor: float,
+    ssml_complement_scale: float,
+    ssml_secondary_peer_require_same_label: bool,
+    ssml_secondary_peer_agreement_min: float,
     ssml_peer_true_prob_threshold: float,
     ssml_peer_student_prob_gap_min: float,
     ssml_student_true_prob_max: float,
@@ -1012,6 +1183,9 @@ def train_one_epoch(
     total_peer_selected_per_class = 0.0
     total_student_aug_consistency_mean = 0.0
     total_peer_aug_consistency_mean = 0.0
+    total_secondary_peer_agreement_ratio = 0.0
+    total_secondary_peer_consensus_ratio = 0.0
+    total_secondary_peer_aug_consistency_mean = 0.0
     total_anchor_loss = 0.0
     total_preserved_disagreement = 0.0
     total_disagreement_floor_gap = 0.0
@@ -1025,7 +1199,13 @@ def train_one_epoch(
             peer_optimizer.zero_grad(set_to_none=True)
         logits = model(x)
 
-        supervised_loss = supervised_loss_fn(logits, y)
+        hard_supervised_loss = supervised_loss_fn(logits, y)
+        train_supervised_loss = (
+            hard_supervised_loss
+            if label_smoothing <= 0.0
+            else F.cross_entropy(logits, y, reduction="none", label_smoothing=label_smoothing)
+        )
+        loss = train_supervised_loss.mean()
         student_positive_ratio = 0.0
         peer_positive_ratio = 0.0
         student_selected_ratio = 0.0
@@ -1063,24 +1243,33 @@ def train_one_epoch(
         peer_selected_per_class = 0.0
         student_aug_consistency_mean = 0.0
         peer_aug_consistency_mean = 0.0
+        secondary_peer_agreement_ratio = 0.0
+        secondary_peer_consensus_ratio = 0.0
+        secondary_peer_aug_consistency_mean = 0.0
         anchor_loss_metric = 0.0
         preserved_disagreement_mean = 0.0
         disagreement_floor_gap_mean = 0.0
         safe_teacher_miss_rate_by_class = torch.zeros(num_classes, dtype=torch.float32, device=device)
 
         if method == "independent":
-            loss = supervised_loss.mean()
             loss.backward()
+            clip_model_gradients(model, grad_clip)
             optimizer.step()
+            update_ema_model(ema_model, model, model_ema_decay)
 
         elif method == "dml":
             if peer_model is None or peer_optimizer is None:
                 raise ValueError("peer_model and peer_optimizer are required when method='dml'")
             peer_logits = peer_model(x)
-            peer_supervised_loss = supervised_loss_fn(peer_logits, y)
+            peer_hard_supervised_loss = supervised_loss_fn(peer_logits, y)
+            peer_train_supervised_loss = (
+                peer_hard_supervised_loss
+                if label_smoothing <= 0.0
+                else F.cross_entropy(peer_logits, y, reduction="none", label_smoothing=label_smoothing)
+            )
             w_student, w_peer = dml_weight_builder(
-                supervised_loss.detach(),
-                peer_supervised_loss.detach(),
+                hard_supervised_loss.detach(),
+                peer_hard_supervised_loss.detach(),
                 margin=margin,
             )
             if lambda_imitation <= 0.0:
@@ -1088,14 +1277,18 @@ def train_one_epoch(
                 w_peer = torch.zeros_like(w_peer)
 
             imitation_term_student = weighted_mean(imitation_loss_fn(logits, peer_logits.detach()), w_student)
-            loss = supervised_loss.mean() + lambda_imitation * imitation_term_student
+            loss = train_supervised_loss.mean() + lambda_imitation * imitation_term_student
 
             imitation_term_peer = weighted_mean(imitation_loss_fn(peer_logits, logits.detach()), w_peer)
-            peer_loss = peer_supervised_loss.mean() + lambda_imitation * imitation_term_peer
+            peer_loss = peer_train_supervised_loss.mean() + lambda_imitation * imitation_term_peer
 
             (loss + peer_loss).backward()
+            clip_model_gradients(model, grad_clip)
+            clip_model_gradients(peer_model, grad_clip)
             optimizer.step()
             peer_optimizer.step()
+            update_ema_model(ema_model, model, model_ema_decay)
+            update_ema_model(ema_peer_model, peer_model, model_ema_decay)
 
         elif method == "ssml":
             if peer_model is None:
@@ -1107,21 +1300,50 @@ def train_one_epoch(
                     peer_logits = peer_model(x)
             else:
                 peer_logits = peer_model(x)
-            peer_supervised_loss = supervised_loss_fn(peer_logits, y)
+            secondary_peer_logits = None
+            if secondary_peer_model is not None:
+                with torch.no_grad():
+                    secondary_peer_logits = secondary_peer_model(x)
+            peer_hard_supervised_loss = supervised_loss_fn(peer_logits, y)
+            peer_train_supervised_loss = (
+                peer_hard_supervised_loss
+                if label_smoothing <= 0.0
+                else F.cross_entropy(peer_logits, y, reduction="none", label_smoothing=label_smoothing)
+            )
             zero = logits.new_tensor(0.0)
-            student_sample_loss = supervised_loss.detach()
-            peer_sample_loss = peer_supervised_loss.detach()
+            student_sample_loss = hard_supervised_loss.detach()
+            peer_sample_loss = peer_hard_supervised_loss.detach()
             student_gap = student_sample_loss - peer_sample_loss
             peer_gap = peer_sample_loss - student_sample_loss
             student_probs = F.softmax(logits.detach(), dim=1)
             peer_probs = F.softmax(peer_logits.detach(), dim=1)
+            secondary_peer_probs = (
+                F.softmax(secondary_peer_logits.detach(), dim=1)
+                if secondary_peer_logits is not None
+                else None
+            )
             student_pred = student_probs.argmax(dim=1)
             peer_pred = peer_probs.argmax(dim=1)
+            secondary_peer_pred = (
+                secondary_peer_probs.argmax(dim=1)
+                if secondary_peer_probs is not None
+                else None
+            )
             student_correct = student_pred.eq(y)
             peer_correct = peer_pred.eq(y)
+            secondary_peer_correct = (
+                secondary_peer_pred.eq(y)
+                if secondary_peer_pred is not None
+                else None
+            )
             prediction_disagreement = student_pred.ne(peer_pred)
             student_true_prob = student_probs.gather(1, y.unsqueeze(1)).squeeze(1)
             peer_true_prob = peer_probs.gather(1, y.unsqueeze(1)).squeeze(1)
+            secondary_peer_true_prob = (
+                secondary_peer_probs.gather(1, y.unsqueeze(1)).squeeze(1)
+                if secondary_peer_probs is not None
+                else None
+            )
             aug_consistency_enabled = (
                 ssml_aug_consistency_weight > 0.0
                 and (
@@ -1130,6 +1352,28 @@ def train_one_epoch(
                     or ssml_aug_consistency_noise_std > 0.0
                 )
             )
+            secondary_consensus_mask = torch.ones_like(student_correct, dtype=torch.bool)
+            if secondary_peer_probs is not None:
+                peer_top1_prob = peer_probs.max(dim=1).values
+                secondary_peer_top1_prob = secondary_peer_probs.max(dim=1).values
+                peer_secondary_agreement = peer_pred.eq(secondary_peer_pred)
+                secondary_peer_agreement_ratio = float(peer_secondary_agreement.float().mean().item())
+                if ssml_secondary_peer_require_same_label:
+                    secondary_consensus_mask &= peer_secondary_agreement
+                if ssml_secondary_peer_agreement_min > 0.0:
+                    secondary_consensus_mask &= (
+                        torch.minimum(peer_top1_prob, secondary_peer_top1_prob)
+                        >= ssml_secondary_peer_agreement_min
+                    )
+                if ssml_peer_true_prob_threshold > 0.0 and secondary_peer_true_prob is not None:
+                    secondary_consensus_mask &= secondary_peer_true_prob >= ssml_peer_true_prob_threshold
+                if (
+                    ssml_peer_student_prob_gap_min > 0.0
+                    and secondary_peer_true_prob is not None
+                ):
+                    secondary_consensus_mask &= (
+                        secondary_peer_true_prob - student_true_prob
+                    ) >= ssml_peer_student_prob_gap_min
             student_scores, peer_scores = compute_ssml_sample_scores(
                 student_sample_loss,
                 peer_sample_loss,
@@ -1145,7 +1389,11 @@ def train_one_epoch(
                 prediction_disagreement=prediction_disagreement,
             )
             if aug_consistency_enabled:
-                student_aug_consistency, peer_aug_consistency = compute_augmented_consistency_scores(
+                (
+                    student_aug_consistency,
+                    peer_aug_consistency,
+                    secondary_peer_aug_consistency,
+                ) = compute_augmented_consistency_scores(
                     model,
                     peer_model,
                     x,
@@ -1154,10 +1402,14 @@ def train_one_epoch(
                     max_shift=ssml_aug_consistency_shift,
                     flip_prob=ssml_aug_consistency_flip_prob,
                     noise_std=ssml_aug_consistency_noise_std,
+                    secondary_model=secondary_peer_model,
+                    secondary_prob_dist=secondary_peer_probs,
                 )
                 if freeze_bn_stats:
                     apply_batchnorm_eval(model)
                     apply_batchnorm_eval(peer_model)
+                    if secondary_peer_model is not None:
+                        apply_batchnorm_eval(secondary_peer_model)
                 student_consistency_factor, peer_consistency_factor = build_aug_consistency_reweight(
                     student_aug_consistency,
                     peer_aug_consistency,
@@ -1167,6 +1419,8 @@ def train_one_epoch(
                 peer_scores = peer_scores * peer_consistency_factor
                 student_aug_consistency_mean = float(student_aug_consistency.mean().item())
                 peer_aug_consistency_mean = float(peer_aug_consistency.mean().item())
+                if secondary_peer_aug_consistency is not None:
+                    secondary_peer_aug_consistency_mean = float(secondary_peer_aug_consistency.mean().item())
                 if ssml_peer_aug_consistency_min > 0.0:
                     student_scores = student_scores * (
                         peer_aug_consistency >= ssml_peer_aug_consistency_min
@@ -1174,6 +1428,10 @@ def train_one_epoch(
                     peer_scores = peer_scores * (
                         student_aug_consistency >= ssml_peer_aug_consistency_min
                     ).to(dtype=peer_scores.dtype)
+                    if secondary_peer_aug_consistency is not None:
+                        secondary_consensus_mask &= (
+                            secondary_peer_aug_consistency >= ssml_peer_aug_consistency_min
+                        )
                 if ssml_student_aug_consistency_max < 1.0:
                     student_scores = student_scores * (
                         student_aug_consistency <= ssml_student_aug_consistency_max
@@ -1190,6 +1448,15 @@ def train_one_epoch(
                         (student_aug_consistency - peer_aug_consistency)
                         >= ssml_peer_student_aug_consistency_gap_min
                     ).to(dtype=peer_scores.dtype)
+                    if secondary_peer_aug_consistency is not None:
+                        secondary_consensus_mask &= (
+                            (secondary_peer_aug_consistency - student_aug_consistency)
+                            >= ssml_peer_student_aug_consistency_gap_min
+                        )
+            if secondary_peer_probs is not None:
+                student_scores = student_scores * secondary_consensus_mask.to(dtype=student_scores.dtype)
+                peer_scores = peer_scores * secondary_consensus_mask.to(dtype=peer_scores.dtype)
+                secondary_peer_consensus_ratio = float(secondary_consensus_mask.float().mean().item())
             student_useful_hard = (~student_correct) & peer_correct & prediction_disagreement
             peer_useful_hard = (~peer_correct) & student_correct & prediction_disagreement
             student_teacher_usable = peer_correct.clone()
@@ -1263,13 +1530,13 @@ def train_one_epoch(
 
             imit_student = imitation_loss_fn(logits, peer_logits.detach())
             hotspot_weight_student = build_sample_hotspot_weights(
-                supervised_loss,
+                train_supervised_loss,
                 student_scores,
                 mask_student,
                 ssml_supervised_hotspot_alpha * guidance_scale,
                 mode=ssml_supervised_weight_mode,
             )
-            supervised_term_student = weighted_mean(supervised_loss, hotspot_weight_student)
+            supervised_term_student = weighted_mean(train_supervised_loss, hotspot_weight_student)
             if ssml_guidance_mode == "reweight_only":
                 imitation_term_student = zero
                 loss = supervised_term_student
@@ -1298,13 +1565,13 @@ def train_one_epoch(
                 disagreement_floor_gap_mean = masked_tensor_mean(disagreement_gap, non_transfer_mask)
 
             hotspot_weight_peer = build_sample_hotspot_weights(
-                peer_supervised_loss,
+                peer_train_supervised_loss,
                 peer_scores,
                 mask_peer,
                 ssml_supervised_hotspot_alpha * guidance_scale,
                 mode=ssml_supervised_weight_mode,
             )
-            supervised_term_peer = weighted_mean(peer_supervised_loss, hotspot_weight_peer)
+            supervised_term_peer = weighted_mean(peer_train_supervised_loss, hotspot_weight_peer)
             if peer_update_disabled:
                 imitation_term_peer = zero
                 peer_loss = zero
@@ -1327,11 +1594,17 @@ def train_one_epoch(
 
             if peer_update_disabled:
                 loss.backward()
+                clip_model_gradients(model, grad_clip)
                 optimizer.step()
+                update_ema_model(ema_model, model, model_ema_decay)
             else:
                 (loss + peer_loss).backward()
+                clip_model_gradients(model, grad_clip)
+                clip_model_gradients(peer_model, grad_clip)
                 optimizer.step()
                 peer_optimizer.step()
+                update_ema_model(ema_model, model, model_ema_decay)
+                update_ema_model(ema_peer_model, peer_model, model_ema_decay)
 
             student_positive_ratio = mask_ratio(student_scores > 0)
             peer_positive_ratio = mask_ratio(peer_scores > 0)
@@ -1430,6 +1703,9 @@ def train_one_epoch(
         total_peer_selected_per_class += peer_selected_per_class * batch_size
         total_student_aug_consistency_mean += student_aug_consistency_mean * batch_size
         total_peer_aug_consistency_mean += peer_aug_consistency_mean * batch_size
+        total_secondary_peer_agreement_ratio += secondary_peer_agreement_ratio * batch_size
+        total_secondary_peer_consensus_ratio += secondary_peer_consensus_ratio * batch_size
+        total_secondary_peer_aug_consistency_mean += secondary_peer_aug_consistency_mean * batch_size
         total_anchor_loss += anchor_loss_metric * batch_size
         total_preserved_disagreement += preserved_disagreement_mean * batch_size
         total_disagreement_floor_gap += disagreement_floor_gap_mean * batch_size
@@ -1475,6 +1751,9 @@ def train_one_epoch(
         "peer_selected_per_class": total_peer_selected_per_class / total_count,
         "student_aug_consistency_mean": total_student_aug_consistency_mean / total_count,
         "peer_aug_consistency_mean": total_peer_aug_consistency_mean / total_count,
+        "secondary_peer_agreement_ratio": total_secondary_peer_agreement_ratio / total_count,
+        "secondary_peer_consensus_ratio": total_secondary_peer_consensus_ratio / total_count,
+        "secondary_peer_aug_consistency_mean": total_secondary_peer_aug_consistency_mean / total_count,
         "anchor_loss_mean": total_anchor_loss / total_count,
         "preserved_disagreement_mean": total_preserved_disagreement / total_count,
         "disagreement_floor_gap_mean": total_disagreement_floor_gap / total_count,
@@ -1513,6 +1792,7 @@ def main():
             batch_size=args.batch_size,
             num_workers=args.num_workers,
             download=args.download,
+            train_aug_mode=args.train_aug_mode,
             train_subset_size=args.train_subset_size,
             val_subset_size=args.val_subset_size,
             seed=args.seed,
@@ -1537,6 +1817,7 @@ def main():
         image_size=image_size,
     ).to(device)
     peer_model = None
+    secondary_peer_model = None
     peer_optimizer = None
     if uses_peer_model(args.method):
         peer_model = build_classification_model(
@@ -1545,10 +1826,24 @@ def main():
             in_channels=in_channels,
             image_size=image_size,
         ).to(device)
+        if args.method == "ssml" and args.ssml_secondary_peer_init_checkpoint:
+            secondary_peer_model = build_classification_model(
+                model_name=pair_meta["peer_model"],
+                num_classes=num_classes,
+                in_channels=in_channels,
+                image_size=image_size,
+            ).to(device)
     loaded_init_checkpoint = load_model_checkpoint(model, args.init_checkpoint, "init")
     loaded_peer_init_checkpoint = None
+    loaded_secondary_peer_init_checkpoint = None
     if peer_model is not None:
         loaded_peer_init_checkpoint = load_model_checkpoint(peer_model, args.peer_init_checkpoint, "peer_init")
+    if secondary_peer_model is not None:
+        loaded_secondary_peer_init_checkpoint = load_model_checkpoint(
+            secondary_peer_model,
+            args.ssml_secondary_peer_init_checkpoint,
+            "secondary_peer_init",
+        )
     ssml_student_only = args.method == "ssml" and args.ssml_student_only and uses_peer_model(args.method)
     ssml_freeze_peer = args.method == "ssml" and args.ssml_freeze_peer and uses_peer_model(args.method)
     peer_update_disabled = ssml_student_only or ssml_freeze_peer
@@ -1556,13 +1851,43 @@ def main():
         for param in peer_model.parameters():
             param.requires_grad_(False)
         peer_model.eval()
+    if secondary_peer_model is not None:
+        for param in secondary_peer_model.parameters():
+            param.requires_grad_(False)
+        secondary_peer_model.eval()
     anchor_params = None
     if args.method == "ssml" and args.ssml_anchor_weight > 0.0:
         anchor_params = snapshot_trainable_parameters(model)
 
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    if args.optimizer == "adamw":
+        optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    elif args.optimizer == "sgd_nesterov":
+        optimizer = torch.optim.SGD(
+            model.parameters(),
+            lr=args.lr,
+            momentum=args.momentum,
+            weight_decay=args.weight_decay,
+            nesterov=True,
+        )
+    else:
+        raise ValueError(f"Unsupported optimizer: {args.optimizer}")
     if peer_model is not None and not peer_update_disabled:
-        peer_optimizer = torch.optim.AdamW(peer_model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+        if args.optimizer == "adamw":
+            peer_optimizer = torch.optim.AdamW(peer_model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+        else:
+            peer_optimizer = torch.optim.SGD(
+                peer_model.parameters(),
+                lr=args.lr,
+                momentum=args.momentum,
+                weight_decay=args.weight_decay,
+                nesterov=True,
+            )
+    ema_model = clone_ema_model(model) if args.model_ema_decay > 0.0 else None
+    ema_peer_model = (
+        clone_ema_model(peer_model)
+        if args.model_ema_decay > 0.0 and peer_model is not None and not peer_update_disabled
+        else None
+    )
 
     run_dir = make_run_dir(
         args.output_dir,
@@ -1592,6 +1917,13 @@ def main():
     best_val_acc_before_activation_epoch = None
     best_val_acc_after_activation = 0.0
     best_val_acc_after_activation_epoch = None
+    best_model_path = run_dir / "best_model.pt"
+    best_peer_model_path = run_dir / "best_peer_model.pt"
+    last_current_lr = get_optimizer_lr(optimizer)
+    last_current_peer_lr = get_optimizer_lr(peer_optimizer)
+    last_effective_ssml_topk_ratio = args.ssml_topk_ratio
+    last_effective_peer_true_prob_threshold = args.ssml_peer_true_prob_threshold
+    last_effective_peer_student_prob_gap_min = args.ssml_peer_student_prob_gap_min
     supervised_loss_fn = lambda logits, targets: F.cross_entropy(logits, targets, reduction="none")
     imitation_loss_fn = build_imitation_loss_fn(args.classification_imitation_loss)
     ssml_elementwise_imitation_loss_fn = build_elementwise_kd_loss_fn(args.distill_temperature)
@@ -1636,6 +1968,9 @@ def main():
         "peer_selected_per_class": 0.0,
         "student_aug_consistency_mean": 0.0,
         "peer_aug_consistency_mean": 0.0,
+        "secondary_peer_agreement_ratio": 0.0,
+        "secondary_peer_consensus_ratio": 0.0,
+        "secondary_peer_aug_consistency_mean": 0.0,
         "anchor_loss_mean": 0.0,
         "preserved_disagreement_mean": 0.0,
         "disagreement_floor_gap_mean": 0.0,
@@ -1643,16 +1978,11 @@ def main():
     }
     warmstart_pair_disagreement = 0.0
     disagreement_floor = 0.0
+    last_effective_disagreement_floor = 0.0
+    last_complement_scale = 1.0
+    last_effective_extra_class_budget_scale = 0.0
     class_deficit_ema = torch.zeros(num_classes, dtype=torch.float32)
-    current_class_budget = (
-        build_deficit_adjusted_class_budgets(
-            args.ssml_per_class_budget,
-            class_deficit_ema,
-            args.ssml_extra_class_budget_scale,
-        )
-        if args.ssml_class_balanced_topk and args.ssml_per_class_budget > 0
-        else None
-    )
+    current_class_budget = None
     last_student_recall_by_class = [0.0 for _ in range(num_classes)]
     last_peer_recall_by_class = [0.0 for _ in range(num_classes)]
     last_class_budget_by_class = (
@@ -1674,6 +2004,50 @@ def main():
         last_peer_recall_by_class = list(warmstart_stats["peer_recall_by_class"])
 
     for epoch in range(1, args.epochs + 1):
+        current_lr = compute_epoch_lr(
+            args.lr,
+            epoch=epoch,
+            total_epochs=args.epochs,
+            scheduler_name=args.lr_scheduler,
+            warmup_epochs=args.scheduler_warmup_epochs,
+            min_scale=args.scheduler_min_scale,
+        )
+        set_optimizer_lr(optimizer, current_lr)
+        current_peer_lr = None
+        if peer_optimizer is not None:
+            current_peer_lr = compute_epoch_lr(
+                args.lr,
+                epoch=epoch,
+                total_epochs=args.epochs,
+                scheduler_name=args.lr_scheduler,
+                warmup_epochs=args.scheduler_warmup_epochs,
+                min_scale=args.scheduler_min_scale,
+            )
+            set_optimizer_lr(peer_optimizer, current_peer_lr)
+        last_current_lr = current_lr
+        last_current_peer_lr = current_peer_lr
+        complement_scale = compute_epoch_ramp_scale(
+            epoch=epoch,
+            start_epoch=args.ssml_complement_ramp_start_epoch,
+            end_epoch=args.ssml_complement_ramp_end_epoch,
+        )
+        effective_disagreement_floor = disagreement_floor * complement_scale
+        effective_extra_class_budget_scale = args.ssml_extra_class_budget_scale * complement_scale
+        last_complement_scale = complement_scale
+        last_effective_disagreement_floor = effective_disagreement_floor
+        last_effective_extra_class_budget_scale = effective_extra_class_budget_scale
+        current_class_budget = (
+            build_deficit_adjusted_class_budgets(
+                args.ssml_per_class_budget,
+                class_deficit_ema,
+                effective_extra_class_budget_scale,
+            )
+            if args.ssml_class_balanced_topk and args.ssml_per_class_budget > 0
+            else None
+        )
+        last_class_budget_by_class = (
+            current_class_budget.tolist() if current_class_budget is not None else [0 for _ in range(num_classes)]
+        )
         effective_lambda = compute_effective_lambda(
             args.lambda_imitation,
             epoch=epoch,
@@ -1691,10 +2065,41 @@ def main():
             decay_end_epoch=args.imitation_decay_end_epoch,
             decay_min_scale=args.imitation_decay_min_scale,
         )
+        effective_ssml_topk_ratio = compute_scheduled_scalar(
+            epoch=epoch,
+            start_value=args.ssml_topk_ratio_start,
+            end_value=args.ssml_topk_ratio_end,
+            ramp_start_epoch=args.ssml_topk_ramp_start_epoch,
+            ramp_end_epoch=args.ssml_topk_ramp_end_epoch,
+            fallback_value=args.ssml_topk_ratio,
+        )
+        effective_peer_true_prob_threshold = compute_scheduled_scalar(
+            epoch=epoch,
+            start_value=args.ssml_peer_true_prob_threshold_start,
+            end_value=args.ssml_peer_true_prob_threshold_end,
+            ramp_start_epoch=args.ssml_topk_ramp_start_epoch,
+            ramp_end_epoch=args.ssml_topk_ramp_end_epoch,
+            fallback_value=args.ssml_peer_true_prob_threshold,
+        )
+        effective_peer_student_prob_gap_min = compute_scheduled_scalar(
+            epoch=epoch,
+            start_value=args.ssml_peer_student_prob_gap_min_start,
+            end_value=args.ssml_peer_student_prob_gap_min_end,
+            ramp_start_epoch=args.ssml_topk_ramp_start_epoch,
+            ramp_end_epoch=args.ssml_topk_ramp_end_epoch,
+            fallback_value=args.ssml_peer_student_prob_gap_min,
+        )
+        last_effective_ssml_topk_ratio = effective_ssml_topk_ratio
+        last_effective_peer_true_prob_threshold = effective_peer_true_prob_threshold
+        last_effective_peer_student_prob_gap_min = effective_peer_student_prob_gap_min
+        effective_freeze_bn_stats = args.freeze_bn_stats and (
+            args.freeze_bn_stats_until_epoch < 0 or epoch <= args.freeze_bn_stats_until_epoch
+        )
 
         train_stats = train_one_epoch(
             model,
             peer_model,
+            secondary_peer_model,
             train_loader,
             optimizer,
             peer_optimizer,
@@ -1702,9 +2107,14 @@ def main():
             supervised_loss_fn=supervised_loss_fn,
             imitation_loss_fn=imitation_loss_fn,
             ssml_elementwise_imitation_loss_fn=ssml_elementwise_imitation_loss_fn,
+            label_smoothing=args.label_smoothing,
+            grad_clip=args.grad_clip,
+            ema_model=ema_model,
+            ema_peer_model=ema_peer_model,
+            model_ema_decay=args.model_ema_decay,
             lambda_imitation=effective_lambda,
             margin=args.margin,
-            ssml_topk_ratio=args.ssml_topk_ratio,
+            ssml_topk_ratio=effective_ssml_topk_ratio,
             ssml_supervised_hotspot_alpha=args.ssml_supervised_hotspot_alpha,
             ssml_topk_scope=args.ssml_topk_scope,
             ssml_supervised_weight_mode=args.ssml_supervised_weight_mode,
@@ -1718,9 +2128,12 @@ def main():
             ssml_per_class_budget=args.ssml_per_class_budget,
             num_classes=num_classes,
             ssml_dynamic_per_class_budget=current_class_budget,
-            ssml_disagreement_floor=disagreement_floor,
-            ssml_peer_true_prob_threshold=args.ssml_peer_true_prob_threshold,
-            ssml_peer_student_prob_gap_min=args.ssml_peer_student_prob_gap_min,
+            ssml_disagreement_floor=effective_disagreement_floor,
+            ssml_complement_scale=complement_scale,
+            ssml_secondary_peer_require_same_label=args.ssml_secondary_peer_require_same_label,
+            ssml_secondary_peer_agreement_min=args.ssml_secondary_peer_agreement_min,
+            ssml_peer_true_prob_threshold=effective_peer_true_prob_threshold,
+            ssml_peer_student_prob_gap_min=effective_peer_student_prob_gap_min,
             ssml_student_true_prob_max=args.ssml_student_true_prob_max,
             ssml_aug_consistency_weight=args.ssml_aug_consistency_weight,
             ssml_aug_consistency_shift=args.ssml_aug_consistency_shift,
@@ -1731,7 +2144,7 @@ def main():
             ssml_peer_student_aug_consistency_gap_min=args.ssml_peer_student_aug_consistency_gap_min,
             guidance_scale=guidance_scale,
             method=args.method,
-            freeze_bn_stats=args.freeze_bn_stats,
+            freeze_bn_stats=effective_freeze_bn_stats,
             hetero_ssml_one_way=hetero_ssml_one_way,
             ssml_student_only=ssml_student_only,
             ssml_freeze_peer=ssml_freeze_peer,
@@ -1741,10 +2154,14 @@ def main():
         )
         last_train_stats = train_stats
         pair_val_details = None
+        eval_model = ema_model if ema_model is not None else model
+        eval_peer_model = (
+            ema_peer_model if ema_peer_model is not None else peer_model
+        )
         if peer_model is not None:
             pair_val_details = evaluate_pair_classification_details(
-                model,
-                peer_model,
+                eval_model,
+                eval_peer_model,
                 val_loader,
                 device,
                 num_classes,
@@ -1756,7 +2173,7 @@ def main():
             last_student_recall_by_class = list(pair_val_details["student_recall_by_class"])
             last_peer_recall_by_class = list(pair_val_details["peer_recall_by_class"])
         else:
-            va_loss, va_acc = evaluate(model, val_loader, device)
+            va_loss, va_acc = evaluate(eval_model, val_loader, device)
             peer_va_loss = None
             peer_va_acc = None
 
@@ -1767,14 +2184,14 @@ def main():
         if va_acc > best_val_acc:
             best_val_acc = va_acc
             best_epoch = epoch
-            torch.save(model.state_dict(), run_dir / "best_model.pt")
+            torch.save(eval_model.state_dict(), best_model_path)
         if peer_va_loss is not None and peer_va_acc is not None:
             peer_val_loss_curve.append(peer_va_loss)
             peer_val_acc_curve.append(peer_va_acc)
             if peer_va_acc > best_peer_val_acc:
                 best_peer_val_acc = peer_va_acc
                 best_peer_epoch = epoch
-                torch.save(peer_model.state_dict(), run_dir / "best_peer_model.pt")
+                torch.save(eval_peer_model.state_dict(), best_peer_model_path)
 
         if args.method == "ssml" and args.ssml_class_balanced_topk and args.ssml_per_class_budget > 0:
             if pair_val_details is not None:
@@ -1788,13 +2205,7 @@ def main():
                 class_deficit_ema = momentum * class_deficit_ema + (1.0 - momentum) * deficit_signal
             else:
                 class_deficit_ema = deficit_signal
-            current_class_budget = build_deficit_adjusted_class_budgets(
-                args.ssml_per_class_budget,
-                class_deficit_ema,
-                args.ssml_extra_class_budget_scale,
-            )
             last_class_deficit_ema = class_deficit_ema.tolist()
-            last_class_budget_by_class = current_class_budget.tolist()
 
         if first_active_epoch is None and train_stats["student_selected_ratio"] > 0.0:
             first_active_epoch = epoch
@@ -1809,8 +2220,13 @@ def main():
 
         status = (
             f"[classification][epoch {epoch:03d}] "
+            f"lr={current_lr:.5f} "
             f"lambda={effective_lambda:.4f} "
             f"g_scale={guidance_scale:.3f} "
+            f"c_scale={complement_scale:.3f} "
+            f"topk={effective_ssml_topk_ratio:.4f} "
+            f"pthr={effective_peer_true_prob_threshold:.4f} "
+            f"pgap={effective_peer_student_prob_gap_min:.4f} "
             f"train_loss={train_stats['train_loss']:.6f} train_acc={train_stats['train_acc']:.4f} "
             f"s_pos={train_stats['student_positive_score_ratio']:.4f} "
             f"s_sel={train_stats['student_selected_ratio']:.4f} "
@@ -1822,6 +2238,8 @@ def main():
             f"dis={train_stats['prediction_disagreement_ratio']:.4f} "
             f"dis_keep={train_stats['preserved_disagreement_mean']:.4f} "
             f"dis_gap={train_stats['disagreement_floor_gap_mean']:.4f} "
+            f"sec_ag={train_stats['secondary_peer_agreement_ratio']:.4f} "
+            f"sec_cons={train_stats['secondary_peer_consensus_ratio']:.4f} "
             f"s_hot_ce={train_stats['student_hotspot_error_mean']:.4f} "
             f"s_bg_ce={train_stats['student_background_error_mean']:.4f} "
             f"s_gap={train_stats['student_hotspot_gap_mean']:.4f} "
@@ -1830,7 +2248,8 @@ def main():
         )
         if peer_va_loss is not None and peer_va_acc is not None:
             status += (
-                f" | p_pos={train_stats['peer_positive_score_ratio']:.4f} "
+                f" | p_lr={current_peer_lr if current_peer_lr is not None else 0.0:.5f} "
+                f"p_pos={train_stats['peer_positive_score_ratio']:.4f} "
                 f"p_sel={train_stats['peer_selected_ratio']:.4f} "
                 f"p_sel_pos={train_stats['peer_selected_of_positive_ratio']:.4f} "
                 f"p_bad={train_stats['peer_incorrect_ratio']:.4f} "
@@ -1849,11 +2268,32 @@ def main():
             {
                 "epoch": epoch,
                 "method": args.method,
+                "protocol_id": args.protocol_id,
+                "hardware_profile": args.hardware_profile,
+                "batch_size": args.batch_size,
+                "num_workers": args.num_workers,
+                "optimizer": args.optimizer,
+                "momentum": args.momentum,
+                "lr": args.lr,
+                "lr_scheduler": args.lr_scheduler,
+                "scheduler_warmup_epochs": args.scheduler_warmup_epochs,
+                "scheduler_min_scale": args.scheduler_min_scale,
+                "current_lr": current_lr,
+                "current_peer_lr": current_peer_lr,
+                "label_smoothing": args.label_smoothing,
+                "grad_clip": args.grad_clip,
+                "model_ema_decay": args.model_ema_decay,
+                "train_aug_mode": args.train_aug_mode,
                 "model": args.model,
                 "peer_model": pair_meta["peer_model"],
                 "lambda_imitation": effective_lambda,
                 "margin": args.margin,
                 "ssml_topk_ratio": args.ssml_topk_ratio,
+                "ssml_topk_ratio_start": args.ssml_topk_ratio_start,
+                "ssml_topk_ratio_end": args.ssml_topk_ratio_end,
+                "ssml_topk_ramp_start_epoch": args.ssml_topk_ramp_start_epoch,
+                "ssml_topk_ramp_end_epoch": args.ssml_topk_ramp_end_epoch,
+                "effective_ssml_topk_ratio": effective_ssml_topk_ratio,
                 "ssml_topk_scope": args.ssml_topk_scope,
                 "ssml_supervised_hotspot_alpha": args.ssml_supervised_hotspot_alpha,
                 "ssml_supervised_weight_mode": args.ssml_supervised_weight_mode,
@@ -1869,8 +2309,19 @@ def main():
                 "ssml_disagreement_floor_ratio": args.ssml_disagreement_floor_ratio,
                 "ssml_deficit_ema_momentum": args.ssml_deficit_ema_momentum,
                 "ssml_extra_class_budget_scale": args.ssml_extra_class_budget_scale,
+                "ssml_complement_ramp_start_epoch": args.ssml_complement_ramp_start_epoch,
+                "ssml_complement_ramp_end_epoch": args.ssml_complement_ramp_end_epoch,
+                "ssml_secondary_peer_init_checkpoint": loaded_secondary_peer_init_checkpoint,
+                "ssml_secondary_peer_require_same_label": args.ssml_secondary_peer_require_same_label,
+                "ssml_secondary_peer_agreement_min": args.ssml_secondary_peer_agreement_min,
                 "ssml_peer_true_prob_threshold": args.ssml_peer_true_prob_threshold,
                 "ssml_peer_student_prob_gap_min": args.ssml_peer_student_prob_gap_min,
+                "ssml_peer_true_prob_threshold_start": args.ssml_peer_true_prob_threshold_start,
+                "ssml_peer_true_prob_threshold_end": args.ssml_peer_true_prob_threshold_end,
+                "ssml_peer_student_prob_gap_min_start": args.ssml_peer_student_prob_gap_min_start,
+                "ssml_peer_student_prob_gap_min_end": args.ssml_peer_student_prob_gap_min_end,
+                "effective_peer_true_prob_threshold": effective_peer_true_prob_threshold,
+                "effective_peer_student_prob_gap_min": effective_peer_student_prob_gap_min,
                 "ssml_aug_consistency_weight": args.ssml_aug_consistency_weight,
                 "ssml_aug_consistency_shift": args.ssml_aug_consistency_shift,
                 "ssml_aug_consistency_flip_prob": args.ssml_aug_consistency_flip_prob,
@@ -1883,8 +2334,14 @@ def main():
                 "ssml_anchor_weight": args.ssml_anchor_weight,
                 "init_checkpoint": loaded_init_checkpoint,
                 "peer_init_checkpoint": loaded_peer_init_checkpoint,
+                "secondary_peer_init_checkpoint": loaded_secondary_peer_init_checkpoint,
                 "guidance_scale": guidance_scale,
+                "complement_scale": complement_scale,
+                "effective_disagreement_floor": effective_disagreement_floor,
+                "effective_extra_class_budget_scale": effective_extra_class_budget_scale,
                 "freeze_bn_stats": args.freeze_bn_stats,
+                "freeze_bn_stats_until_epoch": args.freeze_bn_stats_until_epoch,
+                "effective_freeze_bn_stats": effective_freeze_bn_stats,
                 "train_loss": train_stats["train_loss"],
                 "train_acc": train_stats["train_acc"],
                 "student_positive_score_ratio": train_stats["student_positive_score_ratio"],
@@ -1924,6 +2381,9 @@ def main():
                 "peer_selected_per_class": train_stats["peer_selected_per_class"],
                 "student_aug_consistency_mean": train_stats["student_aug_consistency_mean"],
                 "peer_aug_consistency_mean": train_stats["peer_aug_consistency_mean"],
+                "secondary_peer_agreement_ratio": train_stats["secondary_peer_agreement_ratio"],
+                "secondary_peer_consensus_ratio": train_stats["secondary_peer_consensus_ratio"],
+                "secondary_peer_aug_consistency_mean": train_stats["secondary_peer_aug_consistency_mean"],
                 "anchor_loss_mean": train_stats["anchor_loss_mean"],
                 "preserved_disagreement_mean": train_stats["preserved_disagreement_mean"],
                 "disagreement_floor_gap_mean": train_stats["disagreement_floor_gap_mean"],
@@ -1988,10 +2448,16 @@ def main():
             f"useful_hard_ratio={last_train_stats['student_useful_hard_ratio']:.4f} "
             f"warmstart_dis={warmstart_pair_disagreement:.4f} "
             f"dis_floor={disagreement_floor:.4f} "
+            f"comp_ramp={args.ssml_complement_ramp_start_epoch}->{args.ssml_complement_ramp_end_epoch} "
+            f"comp_scale={last_complement_scale:.3f} "
+            f"sec_ag={last_train_stats['secondary_peer_agreement_ratio']:.4f} "
+            f"sec_cons={last_train_stats['secondary_peer_consensus_ratio']:.4f} "
+            f"sec_ag_min={args.ssml_secondary_peer_agreement_min:.3f} "
             f"preserved_dis={last_train_stats['preserved_disagreement_mean']:.4f} "
             f"dis_gap={last_train_stats['disagreement_floor_gap_mean']:.4f} "
-            f"peer_true_prob_threshold={args.ssml_peer_true_prob_threshold:.3f} "
-            f"peer_student_gap_min={args.ssml_peer_student_prob_gap_min:.3f} "
+            f"peer_true_prob_threshold={last_effective_peer_true_prob_threshold:.3f} "
+            f"peer_student_gap_min={last_effective_peer_student_prob_gap_min:.3f} "
+            f"topk={last_effective_ssml_topk_ratio:.3f} "
             f"aug_consistency_w={args.ssml_aug_consistency_weight:.3f} "
             f"aug_shift={args.ssml_aug_consistency_shift} "
             f"aug_flip={args.ssml_aug_consistency_flip_prob:.2f} "
@@ -2000,6 +2466,7 @@ def main():
             f"student_aug_max={args.ssml_student_aug_consistency_max:.3f} "
             f"aug_gap_min={args.ssml_peer_student_aug_consistency_gap_min:.3f} "
             f"freeze_bn={int(args.freeze_bn_stats)} "
+            f"freeze_bn_until={args.freeze_bn_stats_until_epoch} "
             f"first_active_epoch={first_active_epoch} "
             f"best_before_active={before_text} "
             f"best_after_active={after_text}"
@@ -2022,6 +2489,25 @@ def main():
         "task": "classification",
         "dataset": args.dataset,
         "method": args.method,
+        "protocol_id": args.protocol_id,
+        "hardware_profile": args.hardware_profile,
+        "batch_size": args.batch_size,
+        "num_workers": args.num_workers,
+        "optimizer": args.optimizer,
+        "momentum": args.momentum,
+        "lr": args.lr,
+        "lr_scheduler": args.lr_scheduler,
+        "scheduler_warmup_epochs": args.scheduler_warmup_epochs,
+        "scheduler_min_scale": args.scheduler_min_scale,
+        "last_current_lr": last_current_lr,
+        "last_current_peer_lr": last_current_peer_lr,
+        "label_smoothing": args.label_smoothing,
+        "grad_clip": args.grad_clip,
+        "model_ema_decay": args.model_ema_decay,
+        "ema_evaluation": args.model_ema_decay > 0.0,
+        "train_aug_mode": args.train_aug_mode,
+        "device": str(device),
+        "requested_device": args.device,
         "model": args.model,
         "peer_model": pair_meta["peer_model"],
         "pair_tag": pair_meta["pair_tag"],
@@ -2037,6 +2523,10 @@ def main():
         "lambda_imitation": args.lambda_imitation,
         "margin": args.margin,
         "ssml_topk_ratio": args.ssml_topk_ratio,
+        "ssml_topk_ratio_start": args.ssml_topk_ratio_start,
+        "ssml_topk_ratio_end": args.ssml_topk_ratio_end,
+        "ssml_topk_ramp_start_epoch": args.ssml_topk_ramp_start_epoch,
+        "ssml_topk_ramp_end_epoch": args.ssml_topk_ramp_end_epoch,
         "ssml_topk_scope": args.ssml_topk_scope,
         "ssml_supervised_hotspot_alpha": args.ssml_supervised_hotspot_alpha,
         "ssml_supervised_weight_mode": args.ssml_supervised_weight_mode,
@@ -2052,8 +2542,17 @@ def main():
         "ssml_disagreement_floor_ratio": args.ssml_disagreement_floor_ratio,
         "ssml_deficit_ema_momentum": args.ssml_deficit_ema_momentum,
         "ssml_extra_class_budget_scale": args.ssml_extra_class_budget_scale,
+        "ssml_complement_ramp_start_epoch": args.ssml_complement_ramp_start_epoch,
+        "ssml_complement_ramp_end_epoch": args.ssml_complement_ramp_end_epoch,
+        "ssml_secondary_peer_init_checkpoint": loaded_secondary_peer_init_checkpoint,
+        "ssml_secondary_peer_require_same_label": args.ssml_secondary_peer_require_same_label,
+        "ssml_secondary_peer_agreement_min": args.ssml_secondary_peer_agreement_min,
         "ssml_peer_true_prob_threshold": args.ssml_peer_true_prob_threshold,
         "ssml_peer_student_prob_gap_min": args.ssml_peer_student_prob_gap_min,
+        "ssml_peer_true_prob_threshold_start": args.ssml_peer_true_prob_threshold_start,
+        "ssml_peer_true_prob_threshold_end": args.ssml_peer_true_prob_threshold_end,
+        "ssml_peer_student_prob_gap_min_start": args.ssml_peer_student_prob_gap_min_start,
+        "ssml_peer_student_prob_gap_min_end": args.ssml_peer_student_prob_gap_min_end,
         "ssml_aug_consistency_weight": args.ssml_aug_consistency_weight,
         "ssml_aug_consistency_shift": args.ssml_aug_consistency_shift,
         "ssml_aug_consistency_flip_prob": args.ssml_aug_consistency_flip_prob,
@@ -2066,7 +2565,9 @@ def main():
         "ssml_anchor_weight": args.ssml_anchor_weight,
         "init_checkpoint": loaded_init_checkpoint,
         "peer_init_checkpoint": loaded_peer_init_checkpoint,
+        "secondary_peer_init_checkpoint": loaded_secondary_peer_init_checkpoint,
         "freeze_bn_stats": args.freeze_bn_stats,
+        "freeze_bn_stats_until_epoch": args.freeze_bn_stats_until_epoch,
         "warmup_epochs": args.warmup_epochs,
         "imitation_decay_start_epoch": args.imitation_decay_start_epoch,
         "imitation_decay_end_epoch": args.imitation_decay_end_epoch,
@@ -2102,6 +2603,7 @@ def main():
         "seed": args.seed,
         "epoch_log_path": str(epoch_log_path),
         "best_epoch": best_epoch,
+        "best_val_acc_epoch": best_epoch,
         "first_active_epoch": first_active_epoch,
         "best_val_acc_before_activation": best_val_acc_before_activation if best_val_acc_before_activation_epoch is not None else None,
         "best_val_acc_before_activation_epoch": best_val_acc_before_activation_epoch,
@@ -2159,16 +2661,27 @@ def main():
         "peer_selected_per_class": last_train_stats["peer_selected_per_class"],
         "student_aug_consistency_mean": last_train_stats["student_aug_consistency_mean"],
         "peer_aug_consistency_mean": last_train_stats["peer_aug_consistency_mean"],
+        "secondary_peer_agreement_ratio": last_train_stats["secondary_peer_agreement_ratio"],
+        "secondary_peer_consensus_ratio": last_train_stats["secondary_peer_consensus_ratio"],
+        "secondary_peer_aug_consistency_mean": last_train_stats["secondary_peer_aug_consistency_mean"],
         "anchor_loss_mean": last_train_stats["anchor_loss_mean"],
         "preserved_disagreement_mean": last_train_stats["preserved_disagreement_mean"],
         "disagreement_floor_gap_mean": last_train_stats["disagreement_floor_gap_mean"],
         "warmstart_pair_disagreement": warmstart_pair_disagreement,
         "disagreement_floor": disagreement_floor,
+        "last_effective_disagreement_floor": last_effective_disagreement_floor,
+        "last_complement_scale": last_complement_scale,
+        "last_effective_extra_class_budget_scale": last_effective_extra_class_budget_scale,
+        "last_effective_ssml_topk_ratio": last_effective_ssml_topk_ratio,
+        "last_effective_peer_true_prob_threshold": last_effective_peer_true_prob_threshold,
+        "last_effective_peer_student_prob_gap_min": last_effective_peer_student_prob_gap_min,
         "student_safe_teacher_miss_rate_by_class": last_train_stats["student_safe_teacher_miss_rate_by_class"],
         "student_val_recall_by_class": last_student_recall_by_class,
         "peer_val_recall_by_class": last_peer_recall_by_class,
         "class_deficit_ema": last_class_deficit_ema,
         "dynamic_class_budget_by_class": last_class_budget_by_class,
+        "best_model_path": str(best_model_path),
+        "best_peer_model_path": str(best_peer_model_path) if peer_model is not None else None,
     }
     if peer_model is not None:
         summary.update(
@@ -2188,8 +2701,12 @@ def main():
         summary,
     )
     torch.save(model.state_dict(), run_dir / "model.pt")
+    if ema_model is not None:
+        torch.save(ema_model.state_dict(), run_dir / "ema_model.pt")
     if peer_model is not None:
         torch.save(peer_model.state_dict(), run_dir / "peer_model.pt")
+    if ema_peer_model is not None:
+        torch.save(ema_peer_model.state_dict(), run_dir / "ema_peer_model.pt")
     print("[classification] done")
 
 

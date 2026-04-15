@@ -1,0 +1,126 @@
+{
+  "available_seeds": {
+    "cifarstem_dml_v1": [
+      0,
+      1,
+      2
+    ],
+    "cifarstem_independent_v1": [
+      0,
+      1,
+      2
+    ],
+    "oxtra35_cifarstem_relax_v1": [],
+    "oxtra42_cifarstem_v1": [
+      0,
+      1,
+      2
+    ],
+    "pcu_cifarstem_dense_v1": [
+      0,
+      1,
+      2
+    ],
+    "pcu_cifarstem_sched_l08_t7_v1": [],
+    "pcu_cifarstem_sched_l09_v1": [],
+    "pcu_cifarstem_sched_l10_v1": [],
+    "pcu_cifarstem_sched_v1": []
+  },
+  "candidate_families": {
+    "oxtra35_cifarstem_relax_v1": "oxtra",
+    "oxtra42_cifarstem_v1": "oxtra",
+    "pcu_cifarstem_dense_v1": "pcu",
+    "pcu_cifarstem_sched_l08_t7_v1": "pcu",
+    "pcu_cifarstem_sched_l09_v1": "pcu",
+    "pcu_cifarstem_sched_l10_v1": "pcu",
+    "pcu_cifarstem_sched_v1": "pcu"
+  },
+  "candidate_labels": [
+    "pcu_cifarstem_sched_v1",
+    "pcu_cifarstem_sched_l10_v1",
+    "pcu_cifarstem_dense_v1",
+    "oxtra42_cifarstem_v1",
+    "pcu_cifarstem_sched_l09_v1",
+    "pcu_cifarstem_sched_l08_t7_v1",
+    "oxtra35_cifarstem_relax_v1"
+  ],
+  "cases_complete_3seed": {
+    "oxtra35_cifarstem_relax_v1": false,
+    "oxtra42_cifarstem_v1": true,
+    "pcu_cifarstem_dense_v1": true,
+    "pcu_cifarstem_sched_l08_t7_v1": false,
+    "pcu_cifarstem_sched_l09_v1": false,
+    "pcu_cifarstem_sched_l10_v1": false,
+    "pcu_cifarstem_sched_v1": false
+  },
+  "controls_complete_3seed": {
+    "cifarstem_dml_v1": true,
+    "cifarstem_independent_v1": true
+  },
+  "curve_paths": {
+    "cifarstem_dml_v1": {
+      "0": "results/classification_cifar100_cifarstem_followup_v1/cifarstem_dml_v1/classification/cifar100/resnet34_cifar_gelu_dml_kl_seed0/curves.npz",
+      "1": "results/classification_cifar100_cifarstem_followup_v1/cifarstem_dml_v1/classification/cifar100/resnet34_cifar_gelu_dml_kl_seed1/curves.npz",
+      "2": "results/classification_cifar100_cifarstem_followup_v1/cifarstem_dml_v1/classification/cifar100/resnet34_cifar_gelu_dml_kl_seed2/curves.npz"
+    },
+    "cifarstem_independent_v1": {
+      "0": "results/classification_cifar100_cifarstem_followup_v1/cifarstem_independent_v1/classification/cifar100/resnet34_cifar_gelu_independent_kl_seed0/curves.npz",
+      "1": "results/classification_cifar100_cifarstem_followup_v1/cifarstem_independent_v1/classification/cifar100/resnet34_cifar_gelu_independent_kl_seed1/curves.npz",
+      "2": "results/classification_cifar100_cifarstem_followup_v1/cifarstem_independent_v1/classification/cifar100/resnet34_cifar_gelu_independent_kl_seed2/curves.npz"
+    },
+    "oxtra35_cifarstem_relax_v1": {},
+    "oxtra42_cifarstem_v1": {
+      "0": "results/classification_cifar100_cifarstem_followup_v1/oxtra42_cifarstem_v1/classification/cifar100/resnet34_cifar_gelu_ssml_kl_seed0/curves.npz",
+      "1": "results/classification_cifar100_cifarstem_followup_v1/oxtra42_cifarstem_v1/classification/cifar100/resnet34_cifar_gelu_ssml_kl_seed1/curves.npz",
+      "2": "results/classification_cifar100_cifarstem_followup_v1/oxtra42_cifarstem_v1/classification/cifar100/resnet34_cifar_gelu_ssml_kl_seed2/curves.npz"
+    },
+    "pcu_cifarstem_dense_v1": {
+      "0": "results/classification_cifar100_cifarstem_followup_v1/pcu_cifarstem_dense_v1/classification/cifar100/resnet34_cifar_gelu_ssml_kl_seed0/curves.npz",
+      "1": "results/classification_cifar100_cifarstem_followup_v1/pcu_cifarstem_dense_v1/classification/cifar100/resnet34_cifar_gelu_ssml_kl_seed1/curves.npz",
+      "2": "results/classification_cifar100_cifarstem_followup_v1/pcu_cifarstem_dense_v1/classification/cifar100/resnet34_cifar_gelu_ssml_kl_seed2/curves.npz"
+    },
+    "pcu_cifarstem_sched_l08_t7_v1": {},
+    "pcu_cifarstem_sched_l09_v1": {},
+    "pcu_cifarstem_sched_l10_v1": {},
+    "pcu_cifarstem_sched_v1": {}
+  },
+  "latest_matched_row": {
+    "backbone": "resnet34_cifar_gelu x resnet34_cifar_gelu",
+    "dml": 0.5503000221252442,
+    "independent": 0.5471666830698649,
+    "protocol": "matched 3-seed",
+    "ssml": 0.5507333488464355,
+    "ssml_case": "oxtra42_cifarstem_v1",
+    "ssml_family": "oxtra",
+    "track": "CIFAR-100 cifarstem_followup_v1",
+    "verdict": "SSML > independent and DML"
+  },
+  "pool_complete": {
+    "0": true,
+    "1": true,
+    "2": true
+  },
+  "pool_root": "results/classification_cifar100_bestckpt_pool_cifarstem_v1",
+  "preview_case": "oxtra42_cifarstem_v1",
+  "preview_mode": "matched_3seed",
+  "preview_seeds": [
+    0,
+    1,
+    2
+  ],
+  "promoted_cases": [
+    "oxtra42_cifarstem_v1",
+    "pcu_cifarstem_dense_v1"
+  ],
+  "seed2_scores": {
+    "cifarstem_dml_v1": 0.583400032043457,
+    "cifarstem_independent_v1": 0.5794000221252441,
+    "oxtra42_cifarstem_v1": 0.5848000244140625,
+    "pcu_cifarstem_dense_v1": 0.5838000122070313
+  },
+  "seed2_target_labels": [
+    "oxtra42_cifarstem_v1",
+    "pcu_cifarstem_dense_v1"
+  ],
+  "track": "classification_cifar100_cifarstem_followup_v1"
+}

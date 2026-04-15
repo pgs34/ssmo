@@ -35,6 +35,7 @@ TIME_SERIES_MODEL_CHOICES = [
     "neural_ode",
 ]
 TIME_SERIES_METHOD_CHOICES = ["independent", "dml", "ssml"]
+TIME_SERIES_SSML_EVAL_OUTPUT_CHOICES = ["guided", "student", "peer", "best_branch"]
 
 
 class TimeSeriesCorrectionGate(torch.nn.Module):
@@ -102,6 +103,18 @@ def parse_args():
     p.add_argument("--ssml-freeze-peer", action="store_true")
     p.add_argument("--ssml-worse-only-update", action="store_true")
     p.add_argument("--ssml-anchor-weight", type=float, default=0.0)
+    p.add_argument("--ssml-snapshot-anchor-start-epoch", type=int, default=-1)
+    p.add_argument("--ssml-snapshot-anchor-weight", type=float, default=0.0)
+    p.add_argument(
+        "--ssml-snapshot-anchor-mask-mode",
+        type=str,
+        default="selected",
+        choices=["selected", "all"],
+    )
+    p.add_argument("--ssml-peer-taper-end-epoch", type=int, default=-1)
+    p.add_argument("--ssml-target-active-ratio-start", type=float, default=-1.0)
+    p.add_argument("--ssml-target-active-ratio-end", type=float, default=-1.0)
+    p.add_argument("--ssml-active-ratio-adapt-rate", type=float, default=0.0)
     p.add_argument("--ssml-topk-ratio", type=float, default=0.3)
     p.add_argument("--ssml-topk-scope", type=str, default="total", choices=["total", "positive"])
     p.add_argument("--ssml-max-selected-ratio", type=float, default=1.0)
@@ -159,7 +172,13 @@ def parse_args():
         "--ssml-guidance-mode",
         type=str,
         default="hybrid",
-        choices=["hybrid", "reweight_only", "corrective"],
+        choices=["hybrid", "reweight_only", "corrective", "delta_fusion"],
+    )
+    p.add_argument(
+        "--ssml-eval-output-mode",
+        type=str,
+        default="guided",
+        choices=TIME_SERIES_SSML_EVAL_OUTPUT_CHOICES,
     )
     p.add_argument("--ssml-correction-gate-hidden-dim", type=int, default=32)
     p.add_argument("--ssml-correction-gate-dropout", type=float, default=0.0)
@@ -169,6 +188,7 @@ def parse_args():
     p.add_argument("--ssml-correction-ramp-start-epoch", type=int, default=1)
     p.add_argument("--ssml-correction-ramp-end-epoch", type=int, default=1)
     p.add_argument("--ssml-correction-freeze-student-epochs", type=int, default=0)
+    p.add_argument("--ssml-correction-student-train-end-epoch", type=int, default=-1)
     p.add_argument("--ssml-correction-only", action="store_true")
     p.add_argument("--ssml-correction-tail-start-ratio", type=float, default=0.0)
     p.add_argument("--ssml-correction-regime-focus-quantile", type=float, default=0.0)
@@ -180,6 +200,8 @@ def parse_args():
     p.add_argument("--ssml-router-bin-endpoints", type=str, default="")
     p.add_argument("--ssml-router-ema-decay", type=float, default=0.0)
     p.add_argument("--ssml-trend-only-teaching", action="store_true")
+    p.add_argument("--ssml-fusion-tail-start-ratio", type=float, default=0.0)
+    p.add_argument("--ssml-fusion-max-scale", type=float, default=1.0)
     p.add_argument(
         "--ssml-correction-feature-mode",
         type=str,
@@ -878,6 +900,35 @@ def compute_anchor_penalty(
     return torch.stack(penalties).mean() if penalties else next(model.parameters()).new_tensor(0.0)
 
 
+@torch.no_grad()
+def refresh_frozen_snapshot(
+    snapshot_model: Optional[torch.nn.Module],
+    online_model: torch.nn.Module,
+) -> torch.nn.Module:
+    if snapshot_model is None:
+        return clone_ema_model(online_model)
+    snapshot_model.load_state_dict(copy.deepcopy(online_model.state_dict()))
+    snapshot_model.eval()
+    for param in snapshot_model.parameters():
+        param.requires_grad_(False)
+    return snapshot_model
+
+
+def compute_prediction_anchor_penalty(
+    current_pred: torch.Tensor,
+    anchor_pred: torch.Tensor,
+    *,
+    mask: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    anchor_loss = F.mse_loss(current_pred, anchor_pred.detach(), reduction="none")
+    if mask is None:
+        return anchor_loss.mean()
+    weight = mask.to(dtype=anchor_loss.dtype)
+    if float(weight.sum().item()) <= 0.0:
+        return anchor_loss.new_tensor(0.0)
+    return weighted_mean(anchor_loss, weight)
+
+
 def compute_effective_lambda(
     base_lambda: float,
     *,
@@ -944,6 +995,51 @@ def compute_correction_ramp_scale(
         return 1.0
     progress = (epoch - start_epoch) / max(end_epoch - start_epoch, 1)
     return float(max(0.0, min(1.0, progress)))
+
+
+def compute_linear_epoch_schedule(
+    epoch: int,
+    total_epochs: int,
+    start_value: float,
+    end_value: float,
+) -> float:
+    if total_epochs <= 1:
+        return float(end_value)
+    progress = max(0.0, min(1.0, (epoch - 1) / max(total_epochs - 1, 1)))
+    return float(start_value + (end_value - start_value) * progress)
+
+
+def compute_peer_taper_weight(
+    *,
+    epoch: int,
+    taper_end_epoch: int,
+) -> float:
+    if taper_end_epoch < 0:
+        return 1.0
+    if epoch > taper_end_epoch:
+        return 0.0
+    if taper_end_epoch <= 1:
+        return 1.0
+    progress = max(0.0, min(1.0, (epoch - 1) / max(taper_end_epoch - 1, 1)))
+    return float(max(0.0, 1.0 - progress))
+
+
+def clamp_budget_ratio(value: float) -> float:
+    return float(max(0.10, min(0.80, value)))
+
+
+def adapt_effective_budget_ratio(
+    current_ratio: float,
+    *,
+    observed_active_ratio: float,
+    target_active_ratio: float,
+    adapt_rate: float,
+) -> float:
+    adapt_rate = float(max(0.0, adapt_rate))
+    if adapt_rate <= 0.0:
+        return current_ratio
+    updated = float(current_ratio) + adapt_rate * (float(target_active_ratio) - float(observed_active_ratio))
+    return clamp_budget_ratio(updated)
 
 
 def choose_one_way_imitation_from_scores(
@@ -1337,6 +1433,64 @@ def compute_corrective_prediction(
     return corrected_pred, gate, gate_logits
 
 
+def compute_delta_fusion_prediction(
+    x: torch.Tensor,
+    student_pred: torch.Tensor,
+    peer_pred: torch.Tensor,
+    correction_gate: TimeSeriesCorrectionGate,
+    *,
+    guidance_scale: float,
+    feature_mode: str,
+    use_regime_features: bool,
+    decomposition_kernel: int,
+    tail_start_ratio: float,
+    fusion_max_scale: float,
+    budget_ratio: float = 0.0,
+    horizon_router_weights: Optional[torch.Tensor] = None,
+    horizon_router_bin_endpoints: Optional[list[int]] = None,
+    detach_gate_inputs: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    gate_student_pred = student_pred.detach() if detach_gate_inputs else student_pred
+    gate_peer_pred = peer_pred.detach() if detach_gate_inputs else peer_pred
+    gate_x = x.detach() if detach_gate_inputs else x
+    gate_features = build_correction_gate_features(
+        gate_x,
+        gate_student_pred,
+        gate_peer_pred,
+        feature_mode=feature_mode,
+        use_regime_features=use_regime_features,
+        decomposition_kernel=decomposition_kernel,
+    )
+    gate_logits = correction_gate(gate_features)
+    if gate_logits.ndim > student_pred.ndim:
+        gate_logits = gate_logits[..., 0]
+    gate = torch.sigmoid(gate_logits)
+    focus_mask = build_tail_horizon_mask(student_pred, tail_start_ratio)
+    gate = gate * focus_mask.to(dtype=gate.dtype)
+    router_scale = build_horizon_router_tensor(
+        gate,
+        horizon_router_weights,
+        horizon_router_bin_endpoints,
+    )
+    gate = gate * router_scale
+    candidate_mask = focus_mask > 0
+    if 0.0 < budget_ratio < 1.0:
+        budget_mask = build_budgeted_gate_mask(
+            gate,
+            candidate_mask,
+            budget_ratio,
+        ).to(dtype=gate.dtype)
+        gate = gate * budget_mask
+    fusion_max_scale = max(float(fusion_max_scale), 0.0)
+    gate = gate * fusion_max_scale
+    scaled_gate = gate * guidance_scale
+    if guidance_scale <= 0.0:
+        fused_pred = student_pred
+    else:
+        fused_pred = peer_pred.detach() + scaled_gate * (student_pred - peer_pred.detach())
+    return fused_pred, gate, gate_logits, focus_mask
+
+
 def train_one_epoch(
     model,
     peer_model: Optional[torch.nn.Module],
@@ -1391,6 +1545,8 @@ def train_one_epoch(
     ssml_student_horizon_router_weights: Optional[torch.Tensor],
     ssml_peer_horizon_router_weights: Optional[torch.Tensor],
     ssml_trend_only_teaching: bool,
+    ssml_fusion_tail_start_ratio: float,
+    ssml_fusion_max_scale: float,
     ssml_correction_feature_mode: str,
     ssml_correction_use_regime_features: bool,
     ssml_correction_decomposition_kernel: int,
@@ -1399,6 +1555,7 @@ def train_one_epoch(
     guidance_scale: float,
     correction_apply_scale: float,
     correction_freeze_student: bool,
+    correction_backbone_frozen: bool,
     method: str,
     hetero_ssml_one_way: bool = False,
     ssml_student_only: bool = False,
@@ -1406,11 +1563,13 @@ def train_one_epoch(
     ssml_worse_only_update: bool = False,
     ssml_anchor_weight: float = 0.0,
     anchor_params: Optional[list[torch.Tensor]] = None,
+    snapshot_anchor_model: Optional[torch.nn.Module] = None,
+    snapshot_anchor_weight: float = 0.0,
+    snapshot_anchor_mask_mode: str = "selected",
 ):
     method = canonicalize_method_name(method)
     peer_update_disabled = ssml_student_only or ssml_freeze_peer
-    correction_only = method == "ssml" and ssml_guidance_mode == "corrective" and ssml_correction_only
-    if correction_only:
+    if correction_backbone_frozen:
         model.eval()
     else:
         model.train()
@@ -1457,6 +1616,7 @@ def train_one_epoch(
     total_student_dense_mode_ratio = 0.0
     total_peer_dense_mode_ratio = 0.0
     total_anchor_loss = 0.0
+    total_snapshot_anchor_loss = 0.0
     total_conflict_cosine = 0.0
     total_conflict_projection_applied_ratio = 0.0
     total_correction_focus_ratio = 0.0
@@ -1469,7 +1629,7 @@ def train_one_epoch(
         optimizer.zero_grad(set_to_none=True)
         if peer_optimizer is not None:
             peer_optimizer.zero_grad(set_to_none=True)
-        if correction_only:
+        if correction_backbone_frozen:
             with torch.no_grad():
                 pred = model(x)
         else:
@@ -1508,6 +1668,7 @@ def train_one_epoch(
         student_dense_mode_ratio = 0.0
         peer_dense_mode_ratio = 0.0
         anchor_loss_metric = 0.0
+        snapshot_anchor_loss_metric = 0.0
         conflict_cosine_metric = 0.0
         conflict_projection_applied_ratio = 0.0
         correction_focus_ratio_metric = 1.0
@@ -1560,6 +1721,10 @@ def train_one_epoch(
             with torch.no_grad():
                 teacher_pred_student = ema_peer_model(x) if ema_peer_model is not None else peer_pred.detach()
                 teacher_pred_peer = ema_model(x) if ema_model is not None else pred.detach()
+            snapshot_anchor_pred = None
+            if snapshot_anchor_model is not None and snapshot_anchor_weight > 0.0:
+                with torch.no_grad():
+                    snapshot_anchor_pred = snapshot_anchor_model(x)
             sup_student_elementwise = F.mse_loss(pred, y, reduction="none")
             sup_peer_elementwise = F.mse_loss(peer_pred, y, reduction="none")
             sup_teacher_student = F.mse_loss(teacher_pred_student, y, reduction="none")
@@ -1567,118 +1732,235 @@ def train_one_epoch(
             peer_supervised_loss = sup_peer_elementwise.reshape(sup_peer_elementwise.shape[0], -1).mean(dim=1)
             zero = pred.new_tensor(0.0)
 
-            if ssml_guidance_mode == "corrective":
+            if ssml_guidance_mode in {"corrective", "delta_fusion"}:
                 if correction_gate is None:
-                    raise ValueError("correction_gate is required when ssml_guidance_mode='corrective'")
+                    raise ValueError(
+                        "correction_gate is required when ssml_guidance_mode is corrective or delta_fusion"
+                    )
                 teacher_pred = peer_pred.detach()
-                student_pred_for_correction = pred.detach() if correction_freeze_student else pred
-                correction_focus_mask = build_correction_focus_mask(
-                    x,
-                    pred.detach(),
-                    tail_start_ratio=ssml_correction_tail_start_ratio,
-                    regime_focus_quantile=ssml_correction_regime_focus_quantile,
-                    student_pred=pred.detach(),
-                    teacher_pred=teacher_pred.detach(),
-                    target=y.detach(),
-                    peer_advantage_quantile=ssml_correction_peer_advantage_quantile,
-                    peer_advantage_min=ssml_correction_peer_advantage_min,
-                    peer_advantage_smoothing_kernel=ssml_correction_peer_advantage_smoothing_kernel,
-                )
-                effective_correction_scale = guidance_scale * correction_apply_scale
-                corrected_pred, correction_gate_values, correction_gate_logits = compute_corrective_prediction(
-                    x,
-                    student_pred_for_correction,
-                    teacher_pred,
-                    correction_gate,
-                    guidance_scale=effective_correction_scale,
-                    feature_mode=ssml_correction_feature_mode,
-                    use_regime_features=ssml_correction_use_regime_features,
-                    decomposition_kernel=ssml_correction_decomposition_kernel,
-                    trend_scale=ssml_correction_trend_scale,
-                    residual_scale=ssml_correction_residual_scale,
-                    budget_ratio=ssml_correction_budget_ratio,
-                    focus_mask=correction_focus_mask,
-                    horizon_router_weights=ssml_student_horizon_router_weights,
-                    horizon_router_bin_endpoints=ssml_router_bin_endpoints,
-                    trend_only_teaching=ssml_trend_only_teaching,
-                )
-                corrected_sup_elementwise = F.mse_loss(corrected_pred, y, reduction="none")
-                correction_focus_weights = 1.0 + ssml_correction_focus_loss_alpha * correction_focus_mask.to(
-                    dtype=corrected_sup_elementwise.dtype
-                )
-                supervised_term_student = weighted_mean(corrected_sup_elementwise, correction_focus_weights)
-                teacher_better_mask, branch_teacher_better_mask = compute_corrective_branch_masks(
-                    pred.detach(),
-                    teacher_pred.detach(),
-                    y.detach(),
-                    margin=margin,
-                    feature_mode=ssml_correction_feature_mode,
-                    decomposition_kernel=ssml_correction_decomposition_kernel,
-                )
-                focused_teacher_better_mask = teacher_better_mask * correction_focus_mask.to(dtype=teacher_better_mask.dtype)
-                if branch_teacher_better_mask.ndim > correction_focus_mask.ndim:
-                    branch_focus_mask = correction_focus_mask.unsqueeze(-1).expand_as(branch_teacher_better_mask)
-                else:
-                    branch_focus_mask = correction_focus_mask
-                usefulness_loss = F.binary_cross_entropy_with_logits(
-                    correction_gate_logits,
-                    branch_teacher_better_mask * branch_focus_mask.to(dtype=branch_teacher_better_mask.dtype),
-                    weight=1.0 + ssml_correction_focus_loss_alpha * branch_focus_mask.to(dtype=correction_gate_logits.dtype),
-                )
-                sparsity_penalty = correction_gate_values.mean()
-                imitation_term_student = usefulness_loss
-                loss = (
-                    supervised_term_student
-                    + lambda_imitation * imitation_term_student
-                    + ssml_correction_sparsity_weight * sparsity_penalty
-                )
-
-                loss.backward()
-                optimizer.step()
-
-                mean_weight_metric = float(correction_gate_values.mean().item())
-                if effective_correction_scale <= 0.0:
-                    active_mask = torch.zeros_like(correction_gate_values, dtype=torch.bool)
-                else:
-                    active_mask = (correction_gate_values > ssml_correction_threshold) & correction_focus_mask
-                active_ratio_metric = mask_ratio(active_mask)
-                correction_focus_ratio_metric = mask_ratio(correction_focus_mask)
-                student_positive_ratio = mask_ratio(focused_teacher_better_mask > 0)
-                student_selected_ratio = active_ratio_metric
-                if student_positive_ratio > 0.0:
-                    student_selected_of_positive_ratio = student_selected_ratio / student_positive_ratio
-                student_selected_score_mean = masked_tensor_mean(correction_gate_values, active_mask)
-                student_hotspot_error_mean = masked_tensor_mean(corrected_sup_elementwise.detach(), active_mask)
-                student_background_error_mean = masked_tensor_mean(corrected_sup_elementwise.detach(), ~active_mask)
-                student_hotspot_gap_mean = masked_tensor_mean(
-                    (sup_student_elementwise.detach() - sup_peer_elementwise.detach()),
-                    active_mask,
-                )
-                student_hotspot_error_share = masked_tensor_mean(
-                    focused_teacher_better_mask,
-                    active_mask,
-                )
-                student_error_mean = float(corrected_sup_elementwise.detach().mean().item())
-                student_score_p90 = safe_quantile(correction_gate_values, 0.9)
-                student_worse_ratio = mask_ratio(focused_teacher_better_mask > 0)
-                student_worse_update_ratio = masked_tensor_mean(
-                    focused_teacher_better_mask,
-                    active_mask,
-                )
-                student_update_ratio = active_ratio_metric
-                anchor_loss_metric = float(sparsity_penalty.item())
-                peer_error_mean = float(sup_peer_elementwise.detach().mean().item())
-                if ssml_router_bin_endpoints:
-                    student_router_gain_metric = compute_horizon_bin_relative_gains(
-                        sup_student_elementwise.detach(),
-                        sup_peer_elementwise.detach(),
-                        ssml_router_bin_endpoints,
+                if ssml_guidance_mode == "corrective":
+                    student_pred_for_correction = pred.detach() if correction_freeze_student else pred
+                    correction_focus_mask = build_correction_focus_mask(
+                        x,
+                        pred.detach(),
+                        tail_start_ratio=ssml_correction_tail_start_ratio,
+                        regime_focus_quantile=ssml_correction_regime_focus_quantile,
+                        student_pred=pred.detach(),
+                        teacher_pred=teacher_pred.detach(),
+                        target=y.detach(),
+                        peer_advantage_quantile=ssml_correction_peer_advantage_quantile,
+                        peer_advantage_min=ssml_correction_peer_advantage_min,
+                        peer_advantage_smoothing_kernel=ssml_correction_peer_advantage_smoothing_kernel,
                     )
-                    peer_router_gain_metric = compute_horizon_bin_relative_gains(
-                        sup_peer_elementwise.detach(),
-                        sup_student_elementwise.detach(),
-                        ssml_router_bin_endpoints,
+                    effective_correction_scale = guidance_scale * correction_apply_scale
+                    corrected_pred, correction_gate_values, correction_gate_logits = compute_corrective_prediction(
+                        x,
+                        student_pred_for_correction,
+                        teacher_pred,
+                        correction_gate,
+                        guidance_scale=effective_correction_scale,
+                        feature_mode=ssml_correction_feature_mode,
+                        use_regime_features=ssml_correction_use_regime_features,
+                        decomposition_kernel=ssml_correction_decomposition_kernel,
+                        trend_scale=ssml_correction_trend_scale,
+                        residual_scale=ssml_correction_residual_scale,
+                        budget_ratio=ssml_correction_budget_ratio,
+                        focus_mask=correction_focus_mask,
+                        horizon_router_weights=ssml_student_horizon_router_weights,
+                        horizon_router_bin_endpoints=ssml_router_bin_endpoints,
+                        trend_only_teaching=ssml_trend_only_teaching,
                     )
+                    corrected_sup_elementwise = F.mse_loss(corrected_pred, y, reduction="none")
+                    correction_focus_weights = 1.0 + ssml_correction_focus_loss_alpha * correction_focus_mask.to(
+                        dtype=corrected_sup_elementwise.dtype
+                    )
+                    supervised_term_student = weighted_mean(corrected_sup_elementwise, correction_focus_weights)
+                    teacher_better_mask, branch_teacher_better_mask = compute_corrective_branch_masks(
+                        pred.detach(),
+                        teacher_pred.detach(),
+                        y.detach(),
+                        margin=margin,
+                        feature_mode=ssml_correction_feature_mode,
+                        decomposition_kernel=ssml_correction_decomposition_kernel,
+                    )
+                    focused_teacher_better_mask = teacher_better_mask * correction_focus_mask.to(
+                        dtype=teacher_better_mask.dtype
+                    )
+                    if branch_teacher_better_mask.ndim > correction_focus_mask.ndim:
+                        branch_focus_mask = correction_focus_mask.unsqueeze(-1).expand_as(branch_teacher_better_mask)
+                    else:
+                        branch_focus_mask = correction_focus_mask
+                    usefulness_loss = F.binary_cross_entropy_with_logits(
+                        correction_gate_logits,
+                        branch_teacher_better_mask * branch_focus_mask.to(dtype=branch_teacher_better_mask.dtype),
+                        weight=1.0
+                        + ssml_correction_focus_loss_alpha * branch_focus_mask.to(dtype=correction_gate_logits.dtype),
+                    )
+                    sparsity_penalty = correction_gate_values.mean()
+                    imitation_term_student = usefulness_loss
+                    loss = (
+                        supervised_term_student
+                        + lambda_imitation * imitation_term_student
+                        + ssml_correction_sparsity_weight * sparsity_penalty
+                    )
+                    selected_mask = (correction_gate_values > ssml_correction_threshold) & correction_focus_mask
+                    if snapshot_anchor_pred is not None and snapshot_anchor_weight > 0.0:
+                        snapshot_anchor_mask = (
+                            selected_mask
+                            if snapshot_anchor_mask_mode == "selected"
+                            else None
+                        )
+                        snapshot_anchor_penalty = compute_prediction_anchor_penalty(
+                            pred,
+                            snapshot_anchor_pred,
+                            mask=snapshot_anchor_mask,
+                        )
+                        snapshot_anchor_loss_metric = float(snapshot_anchor_penalty.item())
+                        loss = loss + snapshot_anchor_weight * snapshot_anchor_penalty
+
+                    loss.backward()
+                    optimizer.step()
+
+                    mean_weight_metric = float(correction_gate_values.mean().item())
+                    if effective_correction_scale <= 0.0:
+                        active_mask = torch.zeros_like(correction_gate_values, dtype=torch.bool)
+                    else:
+                        active_mask = selected_mask
+                    active_ratio_metric = mask_ratio(active_mask)
+                    correction_focus_ratio_metric = mask_ratio(correction_focus_mask)
+                    student_positive_ratio = mask_ratio(focused_teacher_better_mask > 0)
+                    student_selected_ratio = active_ratio_metric
+                    if student_positive_ratio > 0.0:
+                        student_selected_of_positive_ratio = student_selected_ratio / student_positive_ratio
+                    student_selected_score_mean = masked_tensor_mean(correction_gate_values, active_mask)
+                    student_hotspot_error_mean = masked_tensor_mean(corrected_sup_elementwise.detach(), active_mask)
+                    student_background_error_mean = masked_tensor_mean(corrected_sup_elementwise.detach(), ~active_mask)
+                    student_hotspot_gap_mean = masked_tensor_mean(
+                        (sup_student_elementwise.detach() - sup_peer_elementwise.detach()),
+                        active_mask,
+                    )
+                    student_hotspot_error_share = masked_tensor_mean(
+                        focused_teacher_better_mask,
+                        active_mask,
+                    )
+                    student_error_mean = float(corrected_sup_elementwise.detach().mean().item())
+                    student_score_p90 = safe_quantile(correction_gate_values, 0.9)
+                    student_worse_ratio = mask_ratio(focused_teacher_better_mask > 0)
+                    student_worse_update_ratio = masked_tensor_mean(
+                        focused_teacher_better_mask,
+                        active_mask,
+                    )
+                    student_update_ratio = active_ratio_metric
+                    anchor_loss_metric = float(sparsity_penalty.item())
+                    peer_error_mean = float(sup_peer_elementwise.detach().mean().item())
+                    if ssml_router_bin_endpoints:
+                        student_router_gain_metric = compute_horizon_bin_relative_gains(
+                            sup_student_elementwise.detach(),
+                            sup_peer_elementwise.detach(),
+                            ssml_router_bin_endpoints,
+                        )
+                        peer_router_gain_metric = compute_horizon_bin_relative_gains(
+                            sup_peer_elementwise.detach(),
+                            sup_student_elementwise.detach(),
+                            ssml_router_bin_endpoints,
+                        )
+                else:
+                    fused_pred, fusion_gate_values, fusion_gate_logits, fusion_focus_mask = compute_delta_fusion_prediction(
+                        x,
+                        pred.detach() if correction_freeze_student else pred,
+                        teacher_pred,
+                        correction_gate,
+                        guidance_scale=guidance_scale * correction_apply_scale,
+                        feature_mode=ssml_correction_feature_mode,
+                        use_regime_features=ssml_correction_use_regime_features,
+                        decomposition_kernel=ssml_correction_decomposition_kernel,
+                        tail_start_ratio=ssml_fusion_tail_start_ratio,
+                        fusion_max_scale=ssml_fusion_max_scale,
+                        budget_ratio=ssml_correction_budget_ratio,
+                        horizon_router_weights=ssml_student_horizon_router_weights,
+                        horizon_router_bin_endpoints=ssml_router_bin_endpoints,
+                    )
+                    fused_sup_elementwise = F.mse_loss(fused_pred, y, reduction="none")
+                    delta_pred = pred - teacher_pred
+                    delta_target = y - teacher_pred
+                    delta_loss_elementwise = F.mse_loss(delta_pred, delta_target.detach(), reduction="none")
+                    fusion_focus_weights = 1.0 + ssml_correction_focus_loss_alpha * fusion_focus_mask.to(
+                        dtype=fused_sup_elementwise.dtype
+                    )
+                    supervised_term_student = weighted_mean(fused_sup_elementwise, fusion_focus_weights)
+                    delta_weights = fusion_gate_values * fusion_focus_mask.to(dtype=fusion_gate_values.dtype)
+                    imitation_term_student = weighted_mean(delta_loss_elementwise, delta_weights)
+                    sparsity_penalty = fusion_gate_values.mean()
+                    loss = (
+                        supervised_term_student
+                        + lambda_imitation * imitation_term_student
+                        + ssml_correction_sparsity_weight * sparsity_penalty
+                    )
+                    selected_mask = (fusion_gate_values > ssml_correction_threshold) & fusion_focus_mask
+                    if snapshot_anchor_pred is not None and snapshot_anchor_weight > 0.0:
+                        snapshot_anchor_mask = (
+                            selected_mask
+                            if snapshot_anchor_mask_mode == "selected"
+                            else None
+                        )
+                        snapshot_anchor_penalty = compute_prediction_anchor_penalty(
+                            pred,
+                            snapshot_anchor_pred,
+                            mask=snapshot_anchor_mask,
+                        )
+                        snapshot_anchor_loss_metric = float(snapshot_anchor_penalty.item())
+                        loss = loss + snapshot_anchor_weight * snapshot_anchor_penalty
+                    if ssml_anchor_weight > 0.0 and anchor_params:
+                        anchor_penalty = compute_anchor_penalty(model, anchor_params)
+                        anchor_loss_metric = float(anchor_penalty.item())
+                        loss = loss + ssml_anchor_weight * anchor_penalty
+                    else:
+                        anchor_loss_metric = float(sparsity_penalty.item())
+
+                    loss.backward()
+                    optimizer.step()
+
+                    if guidance_scale * correction_apply_scale <= 0.0:
+                        active_mask = torch.zeros_like(fusion_gate_values, dtype=torch.bool)
+                    else:
+                        active_mask = selected_mask
+                    mean_weight_metric = float(fusion_gate_values.mean().item())
+                    active_ratio_metric = mask_ratio(active_mask)
+                    correction_focus_ratio_metric = mask_ratio(fusion_focus_mask)
+                    student_positive_ratio = mask_ratio(fusion_focus_mask)
+                    student_selected_ratio = active_ratio_metric
+                    if student_positive_ratio > 0.0:
+                        student_selected_of_positive_ratio = student_selected_ratio / student_positive_ratio
+                    student_selected_score_mean = masked_tensor_mean(fusion_gate_values, active_mask)
+                    student_hotspot_error_mean = masked_tensor_mean(fused_sup_elementwise.detach(), active_mask)
+                    student_background_error_mean = masked_tensor_mean(fused_sup_elementwise.detach(), ~active_mask)
+                    student_hotspot_gap_mean = masked_tensor_mean(
+                        (sup_student_elementwise.detach() - sup_peer_elementwise.detach()),
+                        active_mask,
+                    )
+                    student_hotspot_error_share = masked_tensor_mean(delta_loss_elementwise.detach(), active_mask)
+                    student_error_mean = float(fused_sup_elementwise.detach().mean().item())
+                    student_score_p90 = safe_quantile(fusion_gate_values, 0.9)
+                    student_worse_ratio = mask_ratio(sup_student_elementwise.detach() > sup_peer_elementwise.detach())
+                    student_worse_update_ratio = masked_tensor_mean(
+                        (sup_student_elementwise.detach() > sup_peer_elementwise.detach()).to(
+                            dtype=sup_student_elementwise.dtype
+                        ),
+                        active_mask,
+                    )
+                    student_update_ratio = active_ratio_metric
+                    peer_error_mean = float(sup_peer_elementwise.detach().mean().item())
+                    if ssml_router_bin_endpoints:
+                        student_router_gain_metric = compute_horizon_bin_relative_gains(
+                            fused_sup_elementwise.detach(),
+                            sup_peer_elementwise.detach(),
+                            ssml_router_bin_endpoints,
+                        )
+                        peer_router_gain_metric = compute_horizon_bin_relative_gains(
+                            sup_peer_elementwise.detach(),
+                            fused_sup_elementwise.detach(),
+                            ssml_router_bin_endpoints,
+                        )
                 continue_batch = False
             else:
                 continue_batch = True
@@ -1873,6 +2155,19 @@ def train_one_epoch(
                     imitation_term_student = weighted_mean(imit_student, imitation_weight_student)
                     imitation_objective_student = lambda_imitation * imitation_term_student
                     loss = supervised_objective_student + imitation_objective_student
+                if snapshot_anchor_pred is not None and snapshot_anchor_weight > 0.0:
+                    snapshot_anchor_mask = (
+                        mask_student_imitate
+                        if snapshot_anchor_mask_mode == "selected"
+                        else None
+                    )
+                    snapshot_anchor_penalty = compute_prediction_anchor_penalty(
+                        pred,
+                        snapshot_anchor_pred,
+                        mask=snapshot_anchor_mask,
+                    )
+                    snapshot_anchor_loss_metric = float(snapshot_anchor_penalty.item())
+                    loss = loss + snapshot_anchor_weight * snapshot_anchor_penalty
 
                 hotspot_weight_peer = build_elementwise_hotspot_weights(
                     sup_peer_elementwise,
@@ -2036,6 +2331,7 @@ def train_one_epoch(
         total_student_dense_mode_ratio += student_dense_mode_ratio * batch_size
         total_peer_dense_mode_ratio += peer_dense_mode_ratio * batch_size
         total_anchor_loss += anchor_loss_metric * batch_size
+        total_snapshot_anchor_loss += snapshot_anchor_loss_metric * batch_size
         total_conflict_cosine += conflict_cosine_metric * batch_size
         total_conflict_projection_applied_ratio += conflict_projection_applied_ratio * batch_size
         total_correction_focus_ratio += correction_focus_ratio_metric * batch_size
@@ -2088,6 +2384,7 @@ def train_one_epoch(
         "student_dense_mode_ratio": total_student_dense_mode_ratio / denom,
         "peer_dense_mode_ratio": total_peer_dense_mode_ratio / denom,
         "anchor_loss_mean": total_anchor_loss / denom,
+        "snapshot_anchor_loss_mean": total_snapshot_anchor_loss / denom,
         "conflict_cosine": total_conflict_cosine / denom,
         "conflict_projection_applied_ratio": total_conflict_projection_applied_ratio / denom,
         "correction_focus_ratio": total_correction_focus_ratio / denom,
@@ -2105,6 +2402,85 @@ def train_one_epoch(
 
 
 @torch.no_grad()
+def compute_guided_evaluation_prediction(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    student_pred: torch.Tensor,
+    peer_pred: torch.Tensor,
+    correction_gate: Optional[TimeSeriesCorrectionGate],
+    *,
+    guidance_mode: str,
+    guidance_scale: float,
+    correction_apply_scale: float,
+    correction_tail_start_ratio: float,
+    correction_regime_focus_quantile: float,
+    correction_peer_advantage_quantile: float,
+    correction_peer_advantage_min: float,
+    correction_peer_advantage_smoothing_kernel: int,
+    correction_budget_ratio: float,
+    horizon_router_weights: Optional[torch.Tensor],
+    horizon_router_bin_endpoints: Optional[list[int]],
+    trend_only_teaching: bool,
+    fusion_tail_start_ratio: float,
+    fusion_max_scale: float,
+    correction_feature_mode: str,
+    correction_use_regime_features: bool,
+    correction_decomposition_kernel: int,
+    correction_trend_scale: float,
+    correction_residual_scale: float,
+) -> torch.Tensor:
+    if correction_gate is None:
+        return student_pred
+    if guidance_mode == "delta_fusion":
+        guided_pred, _, _, _ = compute_delta_fusion_prediction(
+            x,
+            student_pred,
+            peer_pred,
+            correction_gate,
+            guidance_scale=guidance_scale * correction_apply_scale,
+            feature_mode=correction_feature_mode,
+            use_regime_features=correction_use_regime_features,
+            decomposition_kernel=correction_decomposition_kernel,
+            tail_start_ratio=fusion_tail_start_ratio,
+            fusion_max_scale=fusion_max_scale,
+            budget_ratio=correction_budget_ratio,
+            horizon_router_weights=horizon_router_weights,
+            horizon_router_bin_endpoints=horizon_router_bin_endpoints,
+        )
+        return guided_pred
+
+    correction_focus_mask = build_correction_focus_mask(
+        x,
+        student_pred.detach(),
+        tail_start_ratio=correction_tail_start_ratio,
+        regime_focus_quantile=correction_regime_focus_quantile,
+        student_pred=student_pred.detach(),
+        teacher_pred=peer_pred.detach(),
+        target=y.detach(),
+        peer_advantage_quantile=correction_peer_advantage_quantile,
+        peer_advantage_min=correction_peer_advantage_min,
+        peer_advantage_smoothing_kernel=correction_peer_advantage_smoothing_kernel,
+    )
+    guided_pred, _, _ = compute_corrective_prediction(
+        x,
+        student_pred,
+        peer_pred,
+        correction_gate,
+        guidance_scale=guidance_scale * correction_apply_scale,
+        focus_mask=correction_focus_mask,
+        horizon_router_weights=horizon_router_weights,
+        horizon_router_bin_endpoints=horizon_router_bin_endpoints,
+        trend_only_teaching=trend_only_teaching,
+        feature_mode=correction_feature_mode,
+        use_regime_features=correction_use_regime_features,
+        decomposition_kernel=correction_decomposition_kernel,
+        trend_scale=correction_trend_scale,
+        residual_scale=correction_residual_scale,
+        budget_ratio=correction_budget_ratio,
+    )
+    return guided_pred
+
+
 def evaluate(
     model,
     loader,
@@ -2112,6 +2488,7 @@ def evaluate(
     *,
     peer_model: Optional[torch.nn.Module] = None,
     correction_gate: Optional[TimeSeriesCorrectionGate] = None,
+    guidance_mode: str = "corrective",
     guidance_scale: float = 1.0,
     correction_apply_scale: float = 1.0,
     correction_tail_start_ratio: float = 0.0,
@@ -2123,62 +2500,108 @@ def evaluate(
     horizon_router_weights: Optional[torch.Tensor] = None,
     horizon_router_bin_endpoints: Optional[list[int]] = None,
     trend_only_teaching: bool = False,
+    fusion_tail_start_ratio: float = 0.0,
+    fusion_max_scale: float = 1.0,
     correction_feature_mode: str = "basic",
     correction_use_regime_features: bool = False,
     correction_decomposition_kernel: int = 9,
     correction_trend_scale: float = 1.0,
     correction_residual_scale: float = 1.0,
-):
+) -> dict[str, dict[str, float]]:
     model.eval()
     if correction_gate is not None:
         correction_gate.eval()
     if peer_model is not None:
         peer_model.eval()
-    total_mse = 0.0
-    total_mae = 0.0
+    branch_totals: dict[str, dict[str, float]] = {
+        "student": {"mse": 0.0, "mae": 0.0},
+        "guided": {"mse": 0.0, "mae": 0.0},
+    }
+    if peer_model is not None:
+        branch_totals["peer"] = {"mse": 0.0, "mae": 0.0}
     total_count = 0
     for x, y in loader:
         x = x.to(device, non_blocking=True)
         y = y.to(device, non_blocking=True)
-        pred = model(x)
-        if correction_gate is not None and peer_model is not None:
-            teacher_pred = peer_model(x)
-            correction_focus_mask = build_correction_focus_mask(
+        student_pred = model(x)
+        guided_pred = student_pred
+        peer_pred = None
+        if peer_model is not None:
+            peer_pred = peer_model(x)
+            guided_pred = compute_guided_evaluation_prediction(
                 x,
-                pred.detach(),
-                tail_start_ratio=correction_tail_start_ratio,
-                regime_focus_quantile=correction_regime_focus_quantile,
-                student_pred=pred.detach(),
-                teacher_pred=teacher_pred.detach(),
-                target=y.detach(),
-                peer_advantage_quantile=correction_peer_advantage_quantile,
-                peer_advantage_min=correction_peer_advantage_min,
-                peer_advantage_smoothing_kernel=correction_peer_advantage_smoothing_kernel,
-            )
-            pred, _, _ = compute_corrective_prediction(
-                x,
-                pred,
-                teacher_pred,
+                y,
+                student_pred,
+                peer_pred,
                 correction_gate,
-                guidance_scale=guidance_scale * correction_apply_scale,
-                focus_mask=correction_focus_mask,
+                guidance_mode=guidance_mode,
+                guidance_scale=guidance_scale,
+                correction_apply_scale=correction_apply_scale,
+                correction_tail_start_ratio=correction_tail_start_ratio,
+                correction_regime_focus_quantile=correction_regime_focus_quantile,
+                correction_peer_advantage_quantile=correction_peer_advantage_quantile,
+                correction_peer_advantage_min=correction_peer_advantage_min,
+                correction_peer_advantage_smoothing_kernel=correction_peer_advantage_smoothing_kernel,
+                correction_budget_ratio=correction_budget_ratio,
                 horizon_router_weights=horizon_router_weights,
                 horizon_router_bin_endpoints=horizon_router_bin_endpoints,
                 trend_only_teaching=trend_only_teaching,
-                feature_mode=correction_feature_mode,
-                use_regime_features=correction_use_regime_features,
-                decomposition_kernel=correction_decomposition_kernel,
-                trend_scale=correction_trend_scale,
-                residual_scale=correction_residual_scale,
-                budget_ratio=correction_budget_ratio,
+                fusion_tail_start_ratio=fusion_tail_start_ratio,
+                fusion_max_scale=fusion_max_scale,
+                correction_feature_mode=correction_feature_mode,
+                correction_use_regime_features=correction_use_regime_features,
+                correction_decomposition_kernel=correction_decomposition_kernel,
+                correction_trend_scale=correction_trend_scale,
+                correction_residual_scale=correction_residual_scale,
             )
-        mse = F.mse_loss(pred, y)
-        mae = F.l1_loss(pred, y)
+        branch_preds = {
+            "student": student_pred,
+            "guided": guided_pred,
+        }
+        if peer_pred is not None:
+            branch_preds["peer"] = peer_pred
         batch_size = x.size(0)
-        total_mse += float(mse.item()) * batch_size
-        total_mae += float(mae.item()) * batch_size
+        for branch_name, branch_pred in branch_preds.items():
+            mse = F.mse_loss(branch_pred, y)
+            mae = F.l1_loss(branch_pred, y)
+            branch_totals[branch_name]["mse"] += float(mse.item()) * batch_size
+            branch_totals[branch_name]["mae"] += float(mae.item()) * batch_size
         total_count += batch_size
-    return total_mse / total_count, total_mae / total_count
+    denom = max(total_count, 1)
+    return {
+        branch_name: {
+            "mse": totals["mse"] / denom,
+            "mae": totals["mae"] / denom,
+        }
+        for branch_name, totals in branch_totals.items()
+    }
+
+
+def select_reported_eval_metrics(
+    branch_metrics: dict[str, dict[str, float]],
+    output_mode: str,
+) -> tuple[str, float, float]:
+    if output_mode == "guided":
+        source = "guided"
+    elif output_mode == "student":
+        source = "student"
+    elif output_mode == "peer":
+        if "peer" not in branch_metrics:
+            raise ValueError("ssml_eval_output_mode='peer' requires a peer_model")
+        source = "peer"
+    elif output_mode == "best_branch":
+        preferred_order = {"guided": 0, "peer": 1, "student": 2}
+        source = min(
+            branch_metrics,
+            key=lambda name: (
+                branch_metrics[name]["mse"],
+                preferred_order.get(name, 99),
+            ),
+        )
+    else:
+        raise ValueError(f"Unsupported ssml_eval_output_mode: {output_mode}")
+    metrics = branch_metrics[source]
+    return source, metrics["mse"], metrics["mae"]
 
 
 def main():
@@ -2212,11 +2635,13 @@ def main():
         num_targets=int(meta["num_targets"]),
     ).to(device)
     corrective_mode = args.method == "ssml" and args.ssml_guidance_mode == "corrective"
+    gated_guidance_mode = args.method == "ssml" and args.ssml_guidance_mode in {"corrective", "delta_fusion"}
     peer_model = None
     peer_optimizer = None
     ema_model = None
     ema_peer_model = None
     correction_gate = None
+    snapshot_anchor_model = None
     if uses_peer_model(args.method):
         peer_model = build_time_series_model(
             model_name=pair_meta["peer_model"],
@@ -2229,11 +2654,13 @@ def main():
     loaded_peer_init_checkpoint = None
     if peer_model is not None:
         loaded_peer_init_checkpoint = load_model_checkpoint(peer_model, args.peer_init_checkpoint, "peer_init")
-    if corrective_mode:
+    if gated_guidance_mode:
         correction_input_dim, correction_output_dim = resolve_correction_gate_shape(
             args.ssml_correction_feature_mode,
             args.ssml_correction_use_regime_features,
         )
+        if args.ssml_guidance_mode == "delta_fusion":
+            correction_output_dim = 1
         correction_gate = TimeSeriesCorrectionGate(
             input_dim=correction_input_dim,
             output_dim=correction_output_dim,
@@ -2242,8 +2669,8 @@ def main():
             init_bias=args.ssml_correction_init_bias,
         ).to(device)
     correction_only = corrective_mode and args.ssml_correction_only
-    ssml_student_only = args.method == "ssml" and (args.ssml_student_only or corrective_mode) and uses_peer_model(args.method)
-    ssml_freeze_peer = args.method == "ssml" and (args.ssml_freeze_peer or corrective_mode) and uses_peer_model(args.method)
+    ssml_student_only = args.method == "ssml" and (args.ssml_student_only or gated_guidance_mode) and uses_peer_model(args.method)
+    ssml_freeze_peer = args.method == "ssml" and (args.ssml_freeze_peer or gated_guidance_mode) and uses_peer_model(args.method)
     peer_update_disabled = ssml_student_only or ssml_freeze_peer
     if correction_only:
         for param in model.parameters():
@@ -2296,13 +2723,24 @@ def main():
     train_active_ratio_curve = []
     val_mse_curve = []
     val_mae_curve = []
+    primary_val_mse_curve = []
+    primary_val_mae_curve = []
+    student_val_mse_curve = []
+    student_val_mae_curve = []
     peer_val_mse_curve = []
     peer_val_mae_curve = []
-    best_val_mse = float("inf")
+    best_reported_val_mse = float("inf")
+    best_primary_val_mse = float("inf")
+    best_student_val_mse = float("inf")
     best_peer_val_mse = float("inf")
     best_epoch = None
+    best_epoch1 = None
+    best_student_epoch = None
     best_peer_epoch = None
+    best_metric_output_source = None
+    last_metric_output_source = "guided"
     first_active_epoch = None
+    snapshot_anchor_enabled_epoch = None
     best_val_before_activation = float("inf")
     best_val_before_activation_epoch = None
     best_val_after_activation = float("inf")
@@ -2348,6 +2786,7 @@ def main():
         "student_dense_mode_ratio": 0.0,
         "peer_dense_mode_ratio": 0.0,
         "anchor_loss_mean": 0.0,
+        "snapshot_anchor_loss_mean": 0.0,
         "conflict_cosine": 0.0,
         "conflict_projection_applied_ratio": 0.0,
         "correction_focus_ratio": 1.0,
@@ -2361,8 +2800,41 @@ def main():
     peer_router_gain_state = torch.zeros(len(router_bin_endpoints), dtype=torch.float32) if router_enabled else None
     student_router_weights = build_horizon_router_weights(student_router_gain_state) if router_enabled else None
     peer_router_weights = build_horizon_router_weights(peer_router_gain_state) if router_enabled else None
+    adaptive_budget_enabled = (
+        gated_guidance_mode
+        and args.ssml_active_ratio_adapt_rate > 0.0
+        and args.ssml_target_active_ratio_start >= 0.0
+        and args.ssml_target_active_ratio_end >= 0.0
+    )
+    effective_correction_budget_ratio = float(args.ssml_correction_budget_ratio)
+    if adaptive_budget_enabled:
+        seed_budget = (
+            effective_correction_budget_ratio
+            if effective_correction_budget_ratio > 0.0
+            else args.ssml_target_active_ratio_start
+        )
+        effective_correction_budget_ratio = clamp_budget_ratio(seed_budget)
+    last_effective_budget_ratio = effective_correction_budget_ratio
+    teacher_guidance_weight = 1.0 if args.method == "ssml" else 0.0
+    current_target_active_ratio = None
+    ssml_eval_output_mode = args.ssml_eval_output_mode if args.method == "ssml" else "guided"
 
     for epoch in range(1, args.epochs + 1):
+        current_target_active_ratio = (
+            compute_linear_epoch_schedule(
+                epoch,
+                args.epochs,
+                args.ssml_target_active_ratio_start,
+                args.ssml_target_active_ratio_end,
+            )
+            if adaptive_budget_enabled
+            else None
+        )
+        teacher_guidance_weight = (
+            compute_peer_taper_weight(epoch=epoch, taper_end_epoch=args.ssml_peer_taper_end_epoch)
+            if args.method == "ssml"
+            else 0.0
+        )
         effective_lambda = compute_effective_lambda(
             args.lambda_imitation,
             epoch=epoch,
@@ -2386,7 +2858,7 @@ def main():
                 start_epoch=args.ssml_correction_ramp_start_epoch,
                 end_epoch=args.ssml_correction_ramp_end_epoch,
             )
-            if corrective_mode
+            if gated_guidance_mode
             else 1.0
         )
         effective_lambda, guidance_scale, correction_apply_scale, handoff_applied = apply_ssml_handoff(
@@ -2396,11 +2868,33 @@ def main():
             guidance_scale=guidance_scale,
             correction_apply_scale=correction_apply_scale,
         )
+        if args.method == "ssml":
+            effective_lambda = effective_lambda * teacher_guidance_weight
+            guidance_scale = guidance_scale * teacher_guidance_weight
         correction_freeze_student = (
             corrective_mode and epoch <= max(args.ssml_correction_freeze_student_epochs, 0)
         )
+        correction_backbone_frozen = (
+            corrective_mode
+            and (
+                args.ssml_correction_only
+                or (
+                    args.ssml_correction_student_train_end_epoch >= 0
+                    and epoch > args.ssml_correction_student_train_end_epoch
+                )
+            )
+        )
         epoch_student_router_weights = student_router_weights.clone() if student_router_weights is not None else None
         epoch_peer_router_weights = peer_router_weights.clone() if peer_router_weights is not None else None
+        snapshot_anchor_enabled = (
+            args.method == "ssml"
+            and snapshot_anchor_model is not None
+            and args.ssml_snapshot_anchor_weight > 0.0
+            and args.ssml_snapshot_anchor_start_epoch >= 0
+            and epoch >= args.ssml_snapshot_anchor_start_epoch
+        )
+        if snapshot_anchor_enabled and snapshot_anchor_enabled_epoch is None:
+            snapshot_anchor_enabled_epoch = epoch
 
         train_stats = train_one_epoch(
             model,
@@ -2451,11 +2945,13 @@ def main():
             ssml_correction_peer_advantage_quantile=args.ssml_correction_peer_advantage_quantile,
             ssml_correction_peer_advantage_min=args.ssml_correction_peer_advantage_min,
             ssml_correction_peer_advantage_smoothing_kernel=args.ssml_correction_peer_advantage_smoothing_kernel,
-            ssml_correction_budget_ratio=args.ssml_correction_budget_ratio,
+            ssml_correction_budget_ratio=effective_correction_budget_ratio,
             ssml_router_bin_endpoints=router_bin_endpoints,
             ssml_student_horizon_router_weights=epoch_student_router_weights,
             ssml_peer_horizon_router_weights=epoch_peer_router_weights,
             ssml_trend_only_teaching=args.ssml_trend_only_teaching,
+            ssml_fusion_tail_start_ratio=args.ssml_fusion_tail_start_ratio,
+            ssml_fusion_max_scale=args.ssml_fusion_max_scale,
             ssml_correction_feature_mode=args.ssml_correction_feature_mode,
             ssml_correction_use_regime_features=args.ssml_correction_use_regime_features,
             ssml_correction_decomposition_kernel=args.ssml_correction_decomposition_kernel,
@@ -2464,6 +2960,7 @@ def main():
             guidance_scale=guidance_scale,
             correction_apply_scale=correction_apply_scale,
             correction_freeze_student=correction_freeze_student,
+            correction_backbone_frozen=correction_backbone_frozen,
             method=args.method,
             hetero_ssml_one_way=hetero_ssml_one_way,
             ssml_student_only=ssml_student_only,
@@ -2471,14 +2968,18 @@ def main():
             ssml_worse_only_update=args.ssml_worse_only_update,
             ssml_anchor_weight=args.ssml_anchor_weight,
             anchor_params=anchor_params,
+            snapshot_anchor_model=snapshot_anchor_model if snapshot_anchor_enabled else None,
+            snapshot_anchor_weight=args.ssml_snapshot_anchor_weight if snapshot_anchor_enabled else 0.0,
+            snapshot_anchor_mask_mode=args.ssml_snapshot_anchor_mask_mode,
         )
         last_train_stats = train_stats
-        va_mse, va_mae = evaluate(
+        eval_metrics = evaluate(
             model,
             val_loader,
             device,
-            peer_model=peer_model if corrective_mode else None,
-            correction_gate=correction_gate if corrective_mode else None,
+            peer_model=peer_model,
+            correction_gate=correction_gate if gated_guidance_mode else None,
+            guidance_mode=args.ssml_guidance_mode,
             guidance_scale=guidance_scale,
             correction_apply_scale=correction_apply_scale,
             correction_tail_start_ratio=args.ssml_correction_tail_start_ratio,
@@ -2486,16 +2987,27 @@ def main():
             correction_peer_advantage_quantile=args.ssml_correction_peer_advantage_quantile,
             correction_peer_advantage_min=args.ssml_correction_peer_advantage_min,
             correction_peer_advantage_smoothing_kernel=args.ssml_correction_peer_advantage_smoothing_kernel,
-            correction_budget_ratio=args.ssml_correction_budget_ratio,
+            correction_budget_ratio=effective_correction_budget_ratio,
             horizon_router_weights=epoch_student_router_weights,
             horizon_router_bin_endpoints=router_bin_endpoints,
             trend_only_teaching=args.ssml_trend_only_teaching,
+            fusion_tail_start_ratio=args.ssml_fusion_tail_start_ratio,
+            fusion_max_scale=args.ssml_fusion_max_scale,
             correction_feature_mode=args.ssml_correction_feature_mode,
             correction_use_regime_features=args.ssml_correction_use_regime_features,
             correction_decomposition_kernel=args.ssml_correction_decomposition_kernel,
             correction_trend_scale=args.ssml_correction_trend_scale,
             correction_residual_scale=args.ssml_correction_residual_scale,
         )
+        student_va_mse = eval_metrics["student"]["mse"]
+        student_va_mae = eval_metrics["student"]["mae"]
+        primary_va_mse = eval_metrics["guided"]["mse"]
+        primary_va_mae = eval_metrics["guided"]["mae"]
+        reported_source, va_mse, va_mae = select_reported_eval_metrics(
+            eval_metrics,
+            ssml_eval_output_mode,
+        )
+        last_metric_output_source = reported_source
         if router_enabled:
             student_router_gain_state = update_horizon_router_state(
                 student_router_gain_state,
@@ -2509,10 +3021,19 @@ def main():
             )
             student_router_weights = build_horizon_router_weights(student_router_gain_state)
             peer_router_weights = build_horizon_router_weights(peer_router_gain_state)
-        peer_va_mse = None
-        peer_va_mae = None
-        if peer_model is not None:
-            peer_va_mse, peer_va_mae = evaluate(peer_model, val_loader, device)
+        logged_effective_budget_ratio = effective_correction_budget_ratio
+        last_effective_budget_ratio = logged_effective_budget_ratio
+        next_effective_correction_budget_ratio = effective_correction_budget_ratio
+        if adaptive_budget_enabled and guidance_scale > 0.0 and teacher_guidance_weight > 0.0:
+            next_effective_correction_budget_ratio = adapt_effective_budget_ratio(
+                effective_correction_budget_ratio,
+                observed_active_ratio=train_stats["active_imitation_ratio"],
+                target_active_ratio=current_target_active_ratio,
+                adapt_rate=args.ssml_active_ratio_adapt_rate,
+            )
+        peer_metrics = eval_metrics.get("peer")
+        peer_va_mse = peer_metrics["mse"] if peer_metrics is not None else None
+        peer_va_mae = peer_metrics["mae"] if peer_metrics is not None else None
         train_total_curve.append(train_stats["train_total"])
         train_mse_curve.append(train_stats["supervised_loss_mean"])
         train_sup_curve.append(train_stats["supervised_loss_mean"])
@@ -2521,16 +3042,31 @@ def main():
         train_active_ratio_curve.append(train_stats["active_imitation_ratio"])
         val_mse_curve.append(va_mse)
         val_mae_curve.append(va_mae)
-        improved = va_mse < (best_val_mse - args.early_stop_min_delta)
-        if improved:
-            best_val_mse = va_mse
-            best_epoch = epoch
+        primary_val_mse_curve.append(primary_va_mse)
+        primary_val_mae_curve.append(primary_va_mae)
+        student_val_mse_curve.append(student_va_mse)
+        student_val_mae_curve.append(student_va_mae)
+        primary_improved = primary_va_mse < (best_primary_val_mse - args.early_stop_min_delta)
+        if primary_improved:
+            best_primary_val_mse = primary_va_mse
+            best_epoch1 = epoch
             early_stop_bad_epochs = 0
             torch.save(model.state_dict(), run_dir / "best_model.pt")
             if correction_gate is not None:
                 torch.save(correction_gate.state_dict(), run_dir / "best_correction_gate.pt")
+            if args.method == "ssml":
+                snapshot_anchor_model = refresh_frozen_snapshot(snapshot_anchor_model, model)
+                torch.save(model.state_dict(), run_dir / "best_snapshot_anchor_model.pt")
         elif early_stop_enabled and epoch >= early_stop_min_epochs:
             early_stop_bad_epochs += 1
+        if student_va_mse < best_student_val_mse:
+            best_student_val_mse = student_va_mse
+            best_student_epoch = epoch
+        reported_improved = va_mse < (best_reported_val_mse - args.early_stop_min_delta)
+        if reported_improved:
+            best_reported_val_mse = va_mse
+            best_epoch = epoch
+            best_metric_output_source = reported_source
         if peer_va_mse is not None and peer_va_mae is not None:
             peer_val_mse_curve.append(peer_va_mse)
             peer_val_mae_curve.append(peer_va_mae)
@@ -2538,6 +3074,7 @@ def main():
                 best_peer_val_mse = peer_va_mse
                 best_peer_epoch = epoch
                 torch.save(peer_model.state_dict(), run_dir / "best_peer_model.pt")
+        effective_correction_budget_ratio = next_effective_correction_budget_ratio
 
         guidance_is_active = (
             args.method == "ssml"
@@ -2550,25 +3087,31 @@ def main():
         if first_active_epoch is None and guidance_is_active:
             first_active_epoch = epoch
         if first_active_epoch is None:
-            if va_mse < best_val_before_activation:
-                best_val_before_activation = va_mse
+            if primary_va_mse < best_val_before_activation:
+                best_val_before_activation = primary_va_mse
                 best_val_before_activation_epoch = epoch
         else:
-            if va_mse < best_val_after_activation:
-                best_val_after_activation = va_mse
+            if primary_va_mse < best_val_after_activation:
+                best_val_after_activation = primary_va_mse
                 best_val_after_activation_epoch = epoch
 
         status = (
             f"[time_series][epoch {epoch:03d}] "
             f"lambda={effective_lambda:.4f} "
             f"g_scale={guidance_scale:.3f} "
+            f"teacher_w={teacher_guidance_weight:.3f} "
             f"handoff={int(handoff_applied)} "
             f"corr_scale={correction_apply_scale:.3f} "
+            f"budget={logged_effective_budget_ratio:.3f} "
+            f"target_active={(current_target_active_ratio if current_target_active_ratio is not None else -1.0):.3f} "
             f"freeze_student={int(correction_freeze_student)} "
+            f"freeze_backbone={int(correction_backbone_frozen)} "
             f"focus={train_stats['correction_focus_ratio']:.4f} "
             f"train_total={train_stats['train_total']:.8f} "
             f"train_sup={train_stats['supervised_loss_mean']:.8f} "
             f"train_imit={train_stats['imitation_loss_mean']:.8f} "
+            f"snap={train_stats['snapshot_anchor_loss_mean']:.8f} "
+            f"snap_w={(args.ssml_snapshot_anchor_weight if snapshot_anchor_enabled else 0.0):.3f} "
             f"mean_w={train_stats['mean_imitation_weight']:.4f} "
             f"active={train_stats['active_imitation_ratio']:.4f} "
             f"s_dense={train_stats['student_dense_mode_ratio']:.2f} "
@@ -2580,8 +3123,14 @@ def main():
             f"s_gap={train_stats['student_hotspot_gap_mean']:.6f} "
             f"conf_cos={train_stats['conflict_cosine']:.4f} "
             f"conf_proj={train_stats['conflict_projection_applied_ratio']:.2f} "
-            f"val_mse={va_mse:.8f} val_mae={va_mae:.8f}"
+            f"val_mse={va_mse:.8f} val_mae={va_mae:.8f} "
+            f"eval={reported_source}"
         )
+        if reported_source != "guided" or abs(primary_va_mse - va_mse) > 1e-12:
+            status += (
+                f" guided_val_mse={primary_va_mse:.8f} "
+                f"student_val_mse={student_va_mse:.8f}"
+            )
         if peer_va_mse is not None and peer_va_mae is not None:
             status += (
                 f" | p_pos={train_stats['peer_positive_score_ratio']:.4f} "
@@ -2614,6 +3163,13 @@ def main():
                 "ssml_freeze_peer": ssml_freeze_peer,
                 "ssml_worse_only_update": args.ssml_worse_only_update,
                 "ssml_anchor_weight": args.ssml_anchor_weight,
+                "ssml_snapshot_anchor_start_epoch": args.ssml_snapshot_anchor_start_epoch,
+                "ssml_snapshot_anchor_weight": args.ssml_snapshot_anchor_weight,
+                "ssml_snapshot_anchor_mask_mode": args.ssml_snapshot_anchor_mask_mode,
+                "ssml_peer_taper_end_epoch": args.ssml_peer_taper_end_epoch,
+                "ssml_target_active_ratio_start": args.ssml_target_active_ratio_start,
+                "ssml_target_active_ratio_end": args.ssml_target_active_ratio_end,
+                "ssml_active_ratio_adapt_rate": args.ssml_active_ratio_adapt_rate,
                 "ssml_topk_ratio": args.ssml_topk_ratio,
                 "ssml_topk_scope": args.ssml_topk_scope,
                 "ssml_max_selected_ratio": args.ssml_max_selected_ratio,
@@ -2640,8 +3196,11 @@ def main():
                 "ssml_router_bin_endpoints": router_bin_endpoints,
                 "ssml_router_ema_decay": args.ssml_router_ema_decay,
                 "ssml_trend_only_teaching": args.ssml_trend_only_teaching,
+                "ssml_fusion_tail_start_ratio": args.ssml_fusion_tail_start_ratio,
+                "ssml_fusion_max_scale": args.ssml_fusion_max_scale,
                 "ssml_conflict_aware_projection": args.ssml_conflict_aware_projection,
                 "ssml_guidance_mode": args.ssml_guidance_mode,
+                "ssml_eval_output_mode": ssml_eval_output_mode,
                 "ssml_correction_init_bias": args.ssml_correction_init_bias,
                 "ssml_correction_ramp_start_epoch": args.ssml_correction_ramp_start_epoch,
                 "ssml_correction_ramp_end_epoch": args.ssml_correction_ramp_end_epoch,
@@ -2660,9 +3219,13 @@ def main():
                 "ssml_correction_trend_scale": args.ssml_correction_trend_scale,
                 "ssml_correction_residual_scale": args.ssml_correction_residual_scale,
                 "guidance_scale": guidance_scale,
+                "teacher_guidance_weight": teacher_guidance_weight,
                 "handoff_applied": handoff_applied,
                 "correction_apply_scale": correction_apply_scale,
+                "effective_budget_ratio": logged_effective_budget_ratio,
+                "target_active_ratio": current_target_active_ratio,
                 "correction_freeze_student": correction_freeze_student,
+                "correction_backbone_frozen": correction_backbone_frozen,
                 "train_total": train_stats["train_total"],
                 "supervised_loss_mean": train_stats["supervised_loss_mean"],
                 "imitation_loss_mean": train_stats["imitation_loss_mean"],
@@ -2697,6 +3260,7 @@ def main():
                 "student_dense_mode_ratio": train_stats["student_dense_mode_ratio"],
                 "peer_dense_mode_ratio": train_stats["peer_dense_mode_ratio"],
                 "anchor_loss_mean": train_stats["anchor_loss_mean"],
+                "snapshot_anchor_loss_mean": train_stats["snapshot_anchor_loss_mean"],
                 "conflict_cosine": train_stats["conflict_cosine"],
                 "conflict_projection_applied_ratio": train_stats["conflict_projection_applied_ratio"],
                 "correction_focus_ratio": train_stats["correction_focus_ratio"],
@@ -2704,15 +3268,28 @@ def main():
                 "peer_horizon_router_relative_gains": train_stats["peer_horizon_router_relative_gains"],
                 "student_horizon_router_weights": epoch_student_router_weights.tolist() if epoch_student_router_weights is not None else [],
                 "peer_horizon_router_weights": epoch_peer_router_weights.tolist() if epoch_peer_router_weights is not None else [],
+                "snapshot_anchor_enabled": snapshot_anchor_enabled,
+                "snapshot_anchor_enabled_epoch_so_far": snapshot_anchor_enabled_epoch,
                 "first_active_epoch_so_far": first_active_epoch,
-                "best_val_mse_so_far": best_val_mse,
+                "best_val_mse_so_far": best_reported_val_mse,
                 "best_epoch_so_far": best_epoch,
+                "best_primary_val_mse_so_far": best_primary_val_mse,
+                "best_primary_epoch_so_far": best_epoch1,
+                "best_student_val_mse_so_far": best_student_val_mse,
+                "best_student_epoch_so_far": best_student_epoch,
                 "best_val_mse_before_activation_so_far": None if math.isinf(best_val_before_activation) else best_val_before_activation,
                 "best_val_mse_before_activation_epoch_so_far": best_val_before_activation_epoch,
                 "best_val_mse_after_activation_so_far": None if math.isinf(best_val_after_activation) else best_val_after_activation,
                 "best_val_mse_after_activation_epoch_so_far": best_val_after_activation_epoch,
+                "val_output_source": reported_source,
                 "val_mse": va_mse,
                 "val_mae": va_mae,
+                "val_mse_reported": va_mse,
+                "val_mae_reported": va_mae,
+                "val_mse_guided": primary_va_mse,
+                "val_mae_guided": primary_va_mae,
+                "val_mse_student": student_va_mse,
+                "val_mae_student": student_va_mae,
                 "peer_val_mse": peer_va_mse,
                 "peer_val_mae": peer_va_mae,
             },
@@ -2743,14 +3320,20 @@ def main():
                 train_active_imitation_ratio=train_active_ratio_curve,
                 val_mse=val_mse_curve,
                 val_mae=val_mae_curve,
+                val_mse_reported=val_mse_curve,
+                val_mae_reported=val_mae_curve,
                 train_total1=train_total_curve,
                 train_mse1=train_mse_curve,
                 train_sup1=train_sup_curve,
                 train_imitation_loss1=train_imitation_curve,
                 train_mean_imitation_weight1=train_mean_weight_curve,
                 train_active_imitation_ratio1=train_active_ratio_curve,
-                val_mse1=val_mse_curve,
-                val_mae1=val_mae_curve,
+                val_mse1=primary_val_mse_curve,
+                val_mae1=primary_val_mae_curve,
+                val_mse_guided=primary_val_mse_curve,
+                val_mae_guided=primary_val_mae_curve,
+                val_mse_student=student_val_mse_curve,
+                val_mae_student=student_val_mae_curve,
                 val_mse2=peer_val_mse_curve,
                 val_mae2=peer_val_mae_curve,
             )
@@ -2775,14 +3358,20 @@ def main():
         train_active_imitation_ratio=train_active_ratio_curve,
         val_mse=val_mse_curve,
         val_mae=val_mae_curve,
+        val_mse_reported=val_mse_curve,
+        val_mae_reported=val_mae_curve,
         train_total1=train_total_curve,
         train_mse1=train_mse_curve,
         train_sup1=train_sup_curve,
         train_imitation_loss1=train_imitation_curve,
         train_mean_imitation_weight1=train_mean_weight_curve,
         train_active_imitation_ratio1=train_active_ratio_curve,
-        val_mse1=val_mse_curve,
-        val_mae1=val_mae_curve,
+        val_mse1=primary_val_mse_curve,
+        val_mae1=primary_val_mae_curve,
+        val_mse_guided=primary_val_mse_curve,
+        val_mae_guided=primary_val_mae_curve,
+        val_mse_student=student_val_mse_curve,
+        val_mae_student=student_val_mae_curve,
         val_mse2=peer_val_mse_curve,
         val_mae2=peer_val_mae_curve,
     )
@@ -2803,6 +3392,12 @@ def main():
             f"freeze_peer={ssml_freeze_peer} "
             f"worse_only={args.ssml_worse_only_update} "
             f"anchor_w={args.ssml_anchor_weight:.5f} "
+            f"snapshot_anchor_start={args.ssml_snapshot_anchor_start_epoch} "
+            f"snapshot_anchor_w={args.ssml_snapshot_anchor_weight:.5f} "
+            f"snapshot_anchor_mask={args.ssml_snapshot_anchor_mask_mode} "
+            f"peer_taper_end={args.ssml_peer_taper_end_epoch} "
+            f"target_active={args.ssml_target_active_ratio_start:.3f}->{args.ssml_target_active_ratio_end:.3f} "
+            f"adapt_rate={args.ssml_active_ratio_adapt_rate:.3f} "
             f"imit_space={args.ssml_imitation_space} "
             f"residual_space_k={args.ssml_residual_space_kernel} "
             f"conflict_proj={int(args.ssml_conflict_aware_projection)} "
@@ -2815,6 +3410,7 @@ def main():
             f"correction_init_bias={args.ssml_correction_init_bias:.3f} "
             f"correction_ramp={args.ssml_correction_ramp_start_epoch}->{args.ssml_correction_ramp_end_epoch} "
             f"correction_freeze_student_epochs={args.ssml_correction_freeze_student_epochs} "
+            f"correction_student_train_end_epoch={args.ssml_correction_student_train_end_epoch} "
             f"correction_only={int(args.ssml_correction_only)} "
             f"correction_tail_start={args.ssml_correction_tail_start_ratio:.2f} "
             f"correction_regime_q={args.ssml_correction_regime_focus_quantile:.2f} "
@@ -2822,15 +3418,18 @@ def main():
             f"correction_peer_adv_q={args.ssml_correction_peer_advantage_quantile:.2f} "
             f"correction_peer_adv_min={args.ssml_correction_peer_advantage_min:.4f} "
             f"correction_peer_adv_k={args.ssml_correction_peer_advantage_smoothing_kernel} "
-            f"correction_budget_ratio={args.ssml_correction_budget_ratio:.3f} "
+            f"correction_budget_ratio={last_effective_budget_ratio:.3f} "
             f"router_bins={router_bin_endpoints} "
             f"router_ema={args.ssml_router_ema_decay:.3f} "
             f"trend_only={int(args.ssml_trend_only_teaching)} "
+            f"fusion_tail={args.ssml_fusion_tail_start_ratio:.2f} "
+            f"fusion_max_scale={args.ssml_fusion_max_scale:.2f} "
             f"correction_feature_mode={args.ssml_correction_feature_mode} "
             f"correction_regime={int(args.ssml_correction_use_regime_features)} "
             f"correction_decomp_k={args.ssml_correction_decomposition_kernel} "
             f"correction_trend_scale={args.ssml_correction_trend_scale:.3f} "
             f"correction_residual_scale={args.ssml_correction_residual_scale:.3f} "
+            f"eval_output={ssml_eval_output_mode} "
             f"first_active_epoch={first_active_epoch} "
             f"best_before_active={before_text} "
             f"best_after_active={after_text}"
@@ -2878,6 +3477,7 @@ def main():
         "student_dense_mode_ratio": last_train_stats["student_dense_mode_ratio"],
         "peer_dense_mode_ratio": last_train_stats["peer_dense_mode_ratio"],
         "anchor_loss_mean": last_train_stats["anchor_loss_mean"],
+        "snapshot_anchor_loss_mean": last_train_stats["snapshot_anchor_loss_mean"],
         "conflict_cosine": last_train_stats["conflict_cosine"],
         "conflict_projection_applied_ratio": last_train_stats["conflict_projection_applied_ratio"],
         "correction_focus_ratio": last_train_stats["correction_focus_ratio"],
@@ -2896,6 +3496,9 @@ def main():
         "stopped_early": stopped_early,
         "stop_epoch": stop_epoch,
         "stop_reason": stop_reason,
+        "teacher_guidance_weight": teacher_guidance_weight,
+        "effective_budget_ratio": last_effective_budget_ratio,
+        "target_active_ratio": current_target_active_ratio,
         "imitation_decay_start_epoch": args.imitation_decay_start_epoch,
         "imitation_decay_end_epoch": args.imitation_decay_end_epoch,
         "imitation_decay_min_scale": args.imitation_decay_min_scale,
@@ -2910,6 +3513,13 @@ def main():
         "ssml_freeze_peer": ssml_freeze_peer,
         "ssml_worse_only_update": args.ssml_worse_only_update,
         "ssml_anchor_weight": args.ssml_anchor_weight,
+        "ssml_snapshot_anchor_start_epoch": args.ssml_snapshot_anchor_start_epoch,
+        "ssml_snapshot_anchor_weight": args.ssml_snapshot_anchor_weight,
+        "ssml_snapshot_anchor_mask_mode": args.ssml_snapshot_anchor_mask_mode,
+        "ssml_peer_taper_end_epoch": args.ssml_peer_taper_end_epoch,
+        "ssml_target_active_ratio_start": args.ssml_target_active_ratio_start,
+        "ssml_target_active_ratio_end": args.ssml_target_active_ratio_end,
+        "ssml_active_ratio_adapt_rate": args.ssml_active_ratio_adapt_rate,
         "ssml_topk_ratio": args.ssml_topk_ratio,
         "ssml_topk_scope": args.ssml_topk_scope,
         "ssml_max_selected_ratio": args.ssml_max_selected_ratio,
@@ -2935,8 +3545,11 @@ def main():
         "ssml_router_bin_endpoints": router_bin_endpoints,
         "ssml_router_ema_decay": args.ssml_router_ema_decay,
         "ssml_trend_only_teaching": args.ssml_trend_only_teaching,
+        "ssml_fusion_tail_start_ratio": args.ssml_fusion_tail_start_ratio,
+        "ssml_fusion_max_scale": args.ssml_fusion_max_scale,
         "ssml_conflict_aware_projection": args.ssml_conflict_aware_projection,
         "ssml_guidance_mode": args.ssml_guidance_mode,
+        "ssml_eval_output_mode": ssml_eval_output_mode,
         "ssml_correction_gate_hidden_dim": args.ssml_correction_gate_hidden_dim,
         "ssml_correction_gate_dropout": args.ssml_correction_gate_dropout,
         "ssml_correction_init_bias": args.ssml_correction_init_bias,
@@ -2945,6 +3558,7 @@ def main():
         "ssml_correction_ramp_start_epoch": args.ssml_correction_ramp_start_epoch,
         "ssml_correction_ramp_end_epoch": args.ssml_correction_ramp_end_epoch,
         "ssml_correction_freeze_student_epochs": args.ssml_correction_freeze_student_epochs,
+        "ssml_correction_student_train_end_epoch": args.ssml_correction_student_train_end_epoch,
         "ssml_correction_only": args.ssml_correction_only,
         "ssml_correction_tail_start_ratio": args.ssml_correction_tail_start_ratio,
         "ssml_correction_regime_focus_quantile": args.ssml_correction_regime_focus_quantile,
@@ -2967,6 +3581,10 @@ def main():
         "ssml_directionality": (
             "frozen_backbone_sparse_correction_gate"
             if correction_only
+            else "peer_base_delta_fusion_with_frozen_teacher"
+            if args.ssml_guidance_mode == "delta_fusion"
+            else "late_handoff_backbone_then_correction_gate"
+            if corrective_mode and args.ssml_correction_student_train_end_epoch >= 0
             else "primary_model_with_frozen_teacher_correction_gate"
             if corrective_mode
             else
@@ -2983,31 +3601,56 @@ def main():
         "init_checkpoint": loaded_init_checkpoint,
         "peer_init_checkpoint": loaded_peer_init_checkpoint,
         "epoch_log_path": str(epoch_log_path),
-        "best_val_mse": best_val_mse,
+        "best_val_mse": best_reported_val_mse,
         "best_epoch": best_epoch,
+        "best_metric_output_source": best_metric_output_source,
+        "final_metric_output_source": last_metric_output_source,
+        "reported_model_idx": 2 if best_metric_output_source == "peer" else 1,
         "first_active_epoch": first_active_epoch,
+        "snapshot_anchor_enabled_epoch": snapshot_anchor_enabled_epoch,
+        "final_correction_backbone_frozen": correction_backbone_frozen,
         "best_model_path": str(run_dir / "best_model.pt"),
         "best_correction_gate_path": str(run_dir / "best_correction_gate.pt") if correction_gate is not None else None,
         "correction_gate_path": str(run_dir / "correction_gate.pt") if correction_gate is not None else None,
+        "best_reported_model_path": (
+            str(run_dir / "best_peer_model.pt")
+            if best_metric_output_source == "peer"
+            else str(run_dir / "best_model.pt")
+        ),
+        "best_snapshot_anchor_model_path": str(run_dir / "best_snapshot_anchor_model.pt"),
         "best_val_mse_before_activation": None if math.isinf(best_val_before_activation) else best_val_before_activation,
         "best_val_mse_before_activation_epoch": best_val_before_activation_epoch,
         "best_val_mse_after_activation": None if math.isinf(best_val_after_activation) else best_val_after_activation,
         "best_val_mse_after_activation_epoch": best_val_after_activation_epoch,
         "final_val_mse": val_mse_curve[-1],
         "final_val_mae": val_mae_curve[-1],
-        "best_final_gap": val_mse_curve[-1] - best_val_mse,
-        "best_metric": best_val_mse,
+        "best_final_gap": val_mse_curve[-1] - best_reported_val_mse,
+        "best_metric": best_reported_val_mse,
         "best_metric_key": "mse",
         "final_metric": val_mse_curve[-1],
-        "best_metric1": best_val_mse,
-        "final_metric1": val_mse_curve[-1],
-        "best_val_mse1": best_val_mse,
-        "final_val_mse1": val_mse_curve[-1],
-        "final_val_mae1": val_mae_curve[-1],
-        "final_val1": val_mse_curve[-1],
+        "best_metric1": best_primary_val_mse,
+        "best_epoch1": best_epoch1,
+        "final_metric1": primary_val_mse_curve[-1],
+        "best_val_mse1": best_primary_val_mse,
+        "final_val_mse1": primary_val_mse_curve[-1],
+        "final_val_mae1": primary_val_mae_curve[-1],
+        "final_val1": primary_val_mse_curve[-1],
+        "best_metric_student": best_student_val_mse,
+        "best_epoch_student": best_student_epoch,
+        "final_metric_student": student_val_mse_curve[-1],
+        "final_val_mae_student": student_val_mae_curve[-1],
+        "best_metric_guided": best_primary_val_mse,
+        "best_epoch_guided": best_epoch1,
+        "final_metric_guided": primary_val_mse_curve[-1],
+        "final_val_mae_guided": primary_val_mae_curve[-1],
         "num_parameters": model_param_count + correction_gate_param_count,
         "num_parameters1": model_param_count + correction_gate_param_count,
         "num_parameters_correction_gate": correction_gate_param_count,
+        "num_parameters_reported": (
+            count_parameters(peer_model)
+            if best_metric_output_source == "peer" and peer_model is not None
+            else model_param_count + correction_gate_param_count
+        ),
         "student_horizon_router_relative_gains": last_train_stats["student_horizon_router_relative_gains"],
         "peer_horizon_router_relative_gains": last_train_stats["peer_horizon_router_relative_gains"],
         "student_horizon_router_weights": student_router_weights.tolist() if student_router_weights is not None else [],

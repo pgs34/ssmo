@@ -1,0 +1,12 @@
+[
+  {
+    "case": "worker2_gpu0",
+    "completed": true,
+    "missing_seeds": [],
+    "count": 3,
+    "mean": 0.5299999999999999,
+    "std": 0.00543384455672656,
+    "gap_to_current_best": -0.0065670000000001005,
+    "gap_to_strongest_baseline": -0.015067000000000053
+  }
+]
