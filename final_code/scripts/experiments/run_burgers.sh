@@ -1,0 +1,125 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")/../common" && pwd)/_common.sh"
+
+FOLLOWUP_OUTPUT_DIR="${FOLLOWUP_OUTPUT_DIR:-$ROOT_DIR/results/operator_burgers_followup_v1/burgers_l005_m0_w12_d60_120_ow1}"
+CTRL_OUTPUT_DIR="${CTRL_OUTPUT_DIR:-$ROOT_DIR/results/operator_burgers_polish_aggressive_v4/ctrl_cos_lr4e4_w10_min02_clip1}"
+SSML_OUTPUT_DIR="${SSML_OUTPUT_DIR:-$ROOT_DIR/results/operator_burgers_polish_aggressive_v4/cos_relay_full_l0012_s20_70_40_sample_lr4e4}"
+LOG_DIR="${LOG_DIR:-$ROOT_DIR/logs/burgers}"
+CUDA_DEVICES="${CUDA_VISIBLE_DEVICES:-${GPU:-0}}"
+CTRL_INIT_TEMPLATE="${INIT_CHECKPOINT_TEMPLATE:-}"
+SSML_INIT_TEMPLATE="${SSML_INIT_CHECKPOINT_TEMPLATE:-${INIT_CHECKPOINT_TEMPLATE:-}}"
+SSML_PEER_INIT_TEMPLATE="${SSML_PEER_INIT_CHECKPOINT_TEMPLATE:-${PEER_INIT_CHECKPOINT_TEMPLATE:-}}"
+BURGERS_STAGE_MAX_PARALLEL_RUNS="${BURGERS_STAGE_MAX_PARALLEL_RUNS:-all}"
+
+if [[ -z "$CTRL_INIT_TEMPLATE" ]]; then
+  CTRL_INIT_TEMPLATE="$FOLLOWUP_OUTPUT_DIR/operator/burgers/fno_independent_mse_seed{seed}/model.pt"
+fi
+if [[ -z "$SSML_INIT_TEMPLATE" ]]; then
+  SSML_INIT_TEMPLATE="$FOLLOWUP_OUTPUT_DIR/operator/burgers/{model}_independent_mse_seed{seed}/model.pt"
+fi
+if [[ -z "$SSML_PEER_INIT_TEMPLATE" ]]; then
+  SSML_PEER_INIT_TEMPLATE="$FOLLOWUP_OUTPUT_DIR/operator/burgers/{model}_independent_mse_seed{seed}/model.pt"
+fi
+
+if [[ "${DRY_RUN:-0}" == "1" ]]; then
+  echo "[burgers] dry_run skip burgers data check"
+else
+  ensure_burgers_data "$ROOT_DIR/data"
+fi
+
+run_locked_job "burgers_followup_v1" "burgers.followup" "$LOG_DIR/followup.log" env \
+  CUDA_VISIBLE_DEVICES="$CUDA_DEVICES" \
+  OUTPUT_DIR="$FOLLOWUP_OUTPUT_DIR" \
+  DATASETS="${DATASETS:-burgers}" \
+  METHODS="${METHODS:-independent dml ssml}" \
+  MODEL_PAIRS="${MODEL_PAIRS:-fno:deeponet}" \
+  INDEPENDENT_MODELS="${INDEPENDENT_MODELS:-fno deeponet}" \
+  REQUIRE_DISTINCT_PEER="${REQUIRE_DISTINCT_PEER:-1}" \
+  SEEDS="${SEEDS:-0 1 2}" \
+  EPOCHS="${EPOCHS:-180}" \
+  BATCH_SIZE="${BATCH_SIZE:-16}" \
+  NUM_WORKERS="${NUM_WORKERS:-2}" \
+  DEVICE="${DEVICE:-cuda}" \
+  LR="${LR:-1e-3}" \
+  WEIGHT_DECAY="${WEIGHT_DECAY:-0.0}" \
+  REGRESSION_IMITATION_LOSS="${REGRESSION_IMITATION_LOSS:-mse}" \
+  LAMBDA_IMITATION="${LAMBDA_IMITATION:-0.05}" \
+  MARGIN="${MARGIN:-0.0}" \
+  WARMUP_EPOCHS="${WARMUP_EPOCHS:-12}" \
+  IMITATION_DECAY_START_EPOCH="${IMITATION_DECAY_START_EPOCH:-60}" \
+  IMITATION_DECAY_END_EPOCH="${IMITATION_DECAY_END_EPOCH:-120}" \
+  IMITATION_DECAY_MIN_SCALE="${IMITATION_DECAY_MIN_SCALE:-0.10}" \
+  HETERO_SSML_ONE_WAY="${HETERO_SSML_ONE_WAY:-1}" \
+  DOWNLOAD="${DOWNLOAD:-0}" \
+  bash "$ROOT_DIR/scripts/common/run_core_operator.sh"
+
+parallel_exec_init "$BURGERS_STAGE_MAX_PARALLEL_RUNS"
+trap parallel_exec_cleanup INT TERM
+
+parallel_exec_submit "burgers.ctrl" run_locked_job "burgers_ctrl_cos" "burgers.ctrl" "$LOG_DIR/ctrl.log" env \
+  CUDA_VISIBLE_DEVICES="$CUDA_DEVICES" \
+  OUTPUT_DIR="$CTRL_OUTPUT_DIR" \
+  DATASETS="${DATASETS:-burgers}" \
+  METHODS="${METHODS:-independent}" \
+  INDEPENDENT_MODELS="${INDEPENDENT_MODELS:-fno}" \
+  SEEDS="${SEEDS:-0 1 2}" \
+  EPOCHS="${EPOCHS:-180}" \
+  BATCH_SIZE="${BATCH_SIZE:-16}" \
+  NUM_WORKERS="${NUM_WORKERS:-2}" \
+  DEVICE="${DEVICE:-cuda}" \
+  LR="${LR:-0.0004}" \
+  WEIGHT_DECAY="${WEIGHT_DECAY:-0.0}" \
+  LR_SCHEDULER="${LR_SCHEDULER:-cosine}" \
+  SCHEDULER_WARMUP_EPOCHS="${SCHEDULER_WARMUP_EPOCHS:-10}" \
+  SCHEDULER_MIN_SCALE="${SCHEDULER_MIN_SCALE:-0.02}" \
+  GRAD_CLIP="${GRAD_CLIP:-1.0}" \
+  REGRESSION_IMITATION_LOSS="${REGRESSION_IMITATION_LOSS:-mse}" \
+  INIT_CHECKPOINT_TEMPLATE="$CTRL_INIT_TEMPLATE" \
+  LAMBDA_IMITATION="${LAMBDA_IMITATION:-0.0}" \
+  WARMUP_EPOCHS="${WARMUP_EPOCHS:-0}" \
+  IMITATION_DECAY_START_EPOCH="${IMITATION_DECAY_START_EPOCH:--1}" \
+  IMITATION_DECAY_END_EPOCH="${IMITATION_DECAY_END_EPOCH:--1}" \
+  SAVE_BEST_CHECKPOINT="${SAVE_BEST_CHECKPOINT:-1}" \
+  DOWNLOAD="${DOWNLOAD:-0}" \
+  bash "$ROOT_DIR/scripts/common/run_core_operator.sh"
+
+parallel_exec_submit "burgers.ssml" run_locked_job "burgers_cos_relay_full" "burgers.ssml" "$LOG_DIR/ssml.log" env \
+  CUDA_VISIBLE_DEVICES="$CUDA_DEVICES" \
+  OUTPUT_DIR="$SSML_OUTPUT_DIR" \
+  DATASETS="${DATASETS:-burgers}" \
+  METHODS="${METHODS:-ssml}" \
+  MODEL_PAIRS="${MODEL_PAIRS:-fno:deeponet}" \
+  REQUIRE_DISTINCT_PEER="${REQUIRE_DISTINCT_PEER:-1}" \
+  SEEDS="${SEEDS:-0 1 2}" \
+  EPOCHS="${EPOCHS:-180}" \
+  BATCH_SIZE="${BATCH_SIZE:-16}" \
+  NUM_WORKERS="${NUM_WORKERS:-2}" \
+  DEVICE="${DEVICE:-cuda}" \
+  LR="${LR:-0.0004}" \
+  WEIGHT_DECAY="${WEIGHT_DECAY:-0.0}" \
+  LR_SCHEDULER="${LR_SCHEDULER:-cosine}" \
+  SCHEDULER_WARMUP_EPOCHS="${SCHEDULER_WARMUP_EPOCHS:-10}" \
+  SCHEDULER_MIN_SCALE="${SCHEDULER_MIN_SCALE:-0.02}" \
+  GRAD_CLIP="${GRAD_CLIP:-1.0}" \
+  REGRESSION_IMITATION_LOSS="${REGRESSION_IMITATION_LOSS:-mse}" \
+  INIT_CHECKPOINT_TEMPLATE="$SSML_INIT_TEMPLATE" \
+  PEER_INIT_CHECKPOINT_TEMPLATE="$SSML_PEER_INIT_TEMPLATE" \
+  LAMBDA_IMITATION="${LAMBDA_IMITATION:-0.012}" \
+  MARGIN="${MARGIN:-0.0}" \
+  WARMUP_EPOCHS="${WARMUP_EPOCHS:-0}" \
+  IMITATION_DECAY_START_EPOCH="${IMITATION_DECAY_START_EPOCH:--1}" \
+  IMITATION_DECAY_END_EPOCH="${IMITATION_DECAY_END_EPOCH:--1}" \
+  IMITATION_DECAY_MIN_SCALE="${IMITATION_DECAY_MIN_SCALE:-1.0}" \
+  SSML_STUDENT_ONLY="${SSML_STUDENT_ONLY:-1}" \
+  SSML_FREEZE_PEER="${SSML_FREEZE_PEER:-1}" \
+  OPERATOR_WEIGHT_GRANULARITY="${OPERATOR_WEIGHT_GRANULARITY:-sample}" \
+  RELAY_HINT_MODE="${RELAY_HINT_MODE:-full}" \
+  RELAY_STAGE_EPOCHS="${RELAY_STAGE_EPOCHS:-20,70,40}" \
+  RELAY_TAPER_SCHEDULE="${RELAY_TAPER_SCHEDULE:-linear}" \
+  SAVE_BEST_CHECKPOINT="${SAVE_BEST_CHECKPOINT:-1}" \
+  DOWNLOAD="${DOWNLOAD:-0}" \
+  bash "$ROOT_DIR/scripts/common/run_core_operator.sh"
+
+parallel_exec_wait_all

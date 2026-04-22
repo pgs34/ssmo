@@ -237,3 +237,10 @@ results/**/summary.json
 results/**/epoch_metrics.jsonl
 results/**/*.log
 results/**/*_by_method.png
+
+# final_code local payloads excluded from the lightweight reproducibility bundle
+final_code/SSMO_tex/
+final_code/data/
+final_code/results/
+final_code/logs/
+final_code/_archive/

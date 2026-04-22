@@ -1,0 +1,294 @@
+{
+  "figure_order": {
+    "time_series": ["etth1", "weather", "electricity"],
+    "operator": ["burgers", "darcy"],
+    "classification": ["cifar10", "cifar100"]
+  },
+  "groups": {
+    "time_series": {
+      "weather": {
+        "display_name": "Weather",
+        "metric_direction": "minimize",
+        "metric_label": "Validation MSE",
+        "metric_scale": 1.0,
+        "figure_window": [1, 20],
+        "note": "3 seeds, lower is better",
+        "methods": {
+          "independent": {
+            "selection": "best_baseline",
+            "curve_mode": "val_mse",
+            "metric_mode": "summary_best",
+            "candidates": [
+              {
+                "name": "transformer",
+                "display_name": "Transformer independent",
+                "run_template": "results/instruction_matrix_v1/time_series/weather/transformer_independent_mse_seed{seed}",
+                "seeds": [0, 1, 2]
+              },
+              {
+                "name": "dlinear",
+                "display_name": "DLinear independent",
+                "run_template": "results/instruction_matrix_v1/time_series/weather/dlinear_independent_mse_seed{seed}",
+                "seeds": [0, 1, 2]
+              }
+            ]
+          },
+          "dml": {
+            "display_name": "Transformer x DLinear DML",
+            "run_template": "results/instruction_matrix_v1/time_series/weather/transformer__dlinear_dml_mse_seed{seed}",
+            "seeds": [0, 1, 2],
+            "curve_mode": "val_mse",
+            "metric_mode": "summary_best"
+          },
+          "ssml": {
+            "display_name": "Transformer x DLinear SSML",
+            "run_template": "results/instruction_matrix_v1/time_series/weather/transformer__dlinear_ssml_mse_seed{seed}",
+            "seeds": [0, 1, 2],
+            "curve_mode": "val_mse",
+            "metric_mode": "summary_best"
+          }
+        }
+      },
+      "electricity": {
+        "display_name": "Electricity",
+        "metric_direction": "minimize",
+        "metric_label": "Validation MSE",
+        "metric_scale": 1.0,
+        "figure_window": [1, 20],
+        "note": "best checkpoint reading",
+        "methods": {
+          "independent": {
+            "selection": "best_baseline",
+            "curve_mode": "val_mse",
+            "metric_mode": "summary_best",
+            "candidates": [
+              {
+                "name": "transformer",
+                "display_name": "Transformer independent",
+                "run_template": "results/time_series_electricity_followup_v1/best_known/time_series/electricity/transformer_independent_mse_seed{seed}",
+                "seeds": [0, 1, 2]
+              },
+              {
+                "name": "dlinear",
+                "display_name": "DLinear independent",
+                "run_template": "results/time_series_electricity_followup_v1/best_known/time_series/electricity/dlinear_independent_mse_seed{seed}",
+                "seeds": [0, 1, 2]
+              }
+            ]
+          },
+          "dml": {
+            "display_name": "Transformer x DLinear DML",
+            "run_template": "results/time_series_electricity_followup_v1/best_known/time_series/electricity/transformer__dlinear_dml_mse_seed{seed}",
+            "seeds": [0, 1, 2],
+            "curve_mode": "val_mse",
+            "metric_mode": "summary_best"
+          },
+          "ssml": {
+            "display_name": "Transformer x DLinear SSML corrective",
+            "run_template": "results/time_series_electricity_corrective_v1/corr_gate64_l15_sp5e4/time_series/electricity/transformer__dlinear_ssml_mse_seed{seed}",
+            "seeds": [0, 1, 2],
+            "curve_mode": "val_mse",
+            "metric_mode": "summary_best"
+          }
+        }
+      },
+      "etth1": {
+        "display_name": "ETTh1",
+        "metric_direction": "minimize",
+        "metric_label": "Validation MSE",
+        "metric_scale": 1.0,
+        "figure_window": [1, 20],
+        "note": "Independent/DML 6 seeds, SSML 3 seeds, best_branch interpretation",
+        "methods": {
+          "independent": {
+            "selection": "best_baseline",
+            "curve_mode": "val_mse",
+            "metric_mode": "summary_best",
+            "candidates": [
+              {
+                "name": "transformer",
+                "display_name": "Transformer independent",
+                "run_template": "results/time_series_etth1_independent_rerun_20260405_v1/time_series/etth1/transformer_independent_huber_seed{seed}",
+                "seeds": [0, 1, 2, 3, 4, 5]
+              },
+              {
+                "name": "dlinear",
+                "display_name": "DLinear independent",
+                "run_template": "results/time_series_etth1_independent_rerun_20260405_v1/time_series/etth1/dlinear_independent_huber_seed{seed}",
+                "seeds": [0, 1, 2, 3, 4, 5]
+              }
+            ]
+          },
+          "dml": {
+            "display_name": "Transformer x DLinear DML",
+            "run_template": "results/time_series_etth1_all_methods_long_v3/time_series/etth1/transformer__dlinear_dml_huber_seed{seed}",
+            "seeds": [0, 1, 2, 3, 4, 5],
+            "curve_mode": "best_branch_mse",
+            "metric_mode": "curve_best"
+          },
+          "ssml": {
+            "display_name": "Transformer x DLinear SSML teacher-ft",
+            "run_template": "results/time_series_etth1_teacher_ft_v1/tft_tail10_reg15_l010_lr2e4/time_series/etth1/transformer__dlinear_ssml_huber_seed{seed}",
+            "seeds": [0, 1, 2],
+            "curve_mode": "best_branch_mse",
+            "metric_mode": "curve_best"
+          }
+        }
+      }
+    },
+    "operator": {
+      "burgers": {
+        "display_name": "Burgers",
+        "metric_direction": "minimize",
+        "metric_label": "Validation MSE",
+        "metric_scale": 1.0,
+        "figure_window": [120, 180],
+        "full_window": [1, 180],
+        "main_methods": ["independent", "dml", "ssml"],
+        "inset_methods": ["independent", "ssml"],
+        "note": "same-campaign independent vs SSML",
+        "methods": {
+          "independent": {
+            "display_name": "FNO independent control",
+            "run_template": "results/operator_burgers_polish_aggressive_v4/ctrl_cos_lr4e4_w10_min02_clip1/operator/burgers/fno_independent_mse_seed{seed}",
+            "seeds": [0, 1, 2],
+            "curve_mode": "val_mse",
+            "metric_mode": "summary_best"
+          },
+          "dml": {
+            "display_name": "FNO x DeepONet DML",
+            "run_template": "results/operator_burgers_followup_v1/burgers_l005_m0_w12_d60_120_ow1/operator/burgers/fno__deeponet_dml_mse_seed{seed}",
+            "seeds": [0, 1, 2],
+            "curve_mode": "val_mse",
+            "metric_mode": "summary_best"
+          },
+          "ssml": {
+            "display_name": "FNO x DeepONet SSML polish",
+            "run_template": "results/operator_burgers_polish_aggressive_v4/cos_relay_full_l0012_s20_70_40_sample_lr4e4/operator/burgers/fno__deeponet_ssml_mse_seed{seed}",
+            "seeds": [0, 1, 2],
+            "curve_mode": "val_mse",
+            "metric_mode": "summary_best"
+          }
+        }
+      },
+      "darcy": {
+        "display_name": "Darcy",
+        "metric_direction": "minimize",
+        "metric_label": "Validation MSE",
+        "metric_scale": 1.0,
+        "figure_window": [110, 150],
+        "full_window": [1, 150],
+        "main_methods": ["independent", "dml", "ssml"],
+        "inset_methods": ["independent", "dml", "ssml"],
+        "note": "same-track independent, DML, SSML",
+        "methods": {
+          "independent": {
+            "selection": "best_baseline",
+            "curve_mode": "val_mse",
+            "metric_mode": "summary_best",
+            "candidates": [
+              {
+                "name": "fno",
+                "display_name": "FNO independent",
+                "run_template": "results/operator_ssml_tuned_v1/operator/darcy/fno_independent_mse_seed{seed}",
+                "seeds": [0, 1, 2]
+              },
+              {
+                "name": "deeponet",
+                "display_name": "DeepONet independent",
+                "run_template": "results/operator_ssml_tuned_v1/operator/darcy/deeponet_independent_mse_seed{seed}",
+                "seeds": [0, 1, 2]
+              }
+            ]
+          },
+          "dml": {
+            "display_name": "FNO x DeepONet DML",
+            "run_template": "results/operator_ssml_tuned_v1/operator/darcy/fno__deeponet_dml_mse_seed{seed}",
+            "seeds": [0, 1, 2],
+            "curve_mode": "val_mse",
+            "metric_mode": "summary_best"
+          },
+          "ssml": {
+            "display_name": "FNO x DeepONet SSML",
+            "run_template": "results/operator_ssml_tuned_v1/operator/darcy/fno__deeponet_ssml_mse_seed{seed}",
+            "seeds": [0, 1, 2],
+            "curve_mode": "val_mse",
+            "metric_mode": "summary_best"
+          }
+        }
+      }
+    },
+    "classification": {
+      "cifar10": {
+        "display_name": "CIFAR-10",
+        "metric_direction": "maximize",
+        "metric_label": "Validation Accuracy (%)",
+        "metric_scale": 100.0,
+        "figure_window": [1, 100],
+        "note": "acc1 (%), higher is better",
+        "methods": {
+          "independent": {
+            "display_name": "ResNet-18 independent",
+            "run_template": "results/instruction_matrix_v1/classification/cifar10/resnet18_independent_kl_seed{seed}",
+            "seeds": [0, 1, 2],
+            "curve_mode": "val_acc_percent",
+            "metric_mode": "summary_best"
+          },
+          "dml": {
+            "display_name": "ResNet-18 DML long rerun",
+            "run_template": "results/classification_cifar10_homo_dml_long_v1/classification/cifar10/resnet18_dml_kl_seed{seed}",
+            "seeds": [0, 1, 2],
+            "curve_mode": "val_acc_percent",
+            "metric_mode": "summary_best"
+          },
+          "ssml": {
+            "display_name": "ResNet-18 SSML",
+            "run_template": "results/instruction_matrix_v1/classification/cifar10/resnet18_ssml_kl_seed{seed}",
+            "seeds": [0, 1, 2],
+            "curve_mode": "val_acc_percent",
+            "metric_mode": "summary_best"
+          }
+        }
+      },
+      "cifar100": {
+        "display_name": "CIFAR-100",
+        "metric_direction": "maximize",
+        "metric_label": "Validation Accuracy (%)",
+        "metric_scale": 100.0,
+        "figure_window": [1, 50],
+        "note": "cifarstem follow-up row",
+        "dependencies": [
+          {
+            "name": "bestckpt_pool",
+            "display_name": "Best checkpoint pool",
+            "run_template": "results/classification_cifar100_bestckpt_pool_cifarstem_v1/classification/classification/cifar100/resnet34_cifar_gelu_independent_kl_seed{seed}",
+            "seeds": [0, 1, 2]
+          }
+        ],
+        "methods": {
+          "independent": {
+            "display_name": "ResNet-34-CIFAR-GELU independent",
+            "run_template": "results/classification_cifar100_cifarstem_followup_v1/cifarstem_independent_v1/classification/cifar100/resnet34_cifar_gelu_independent_kl_seed{seed}",
+            "seeds": [0, 1, 2],
+            "curve_mode": "val_acc_percent",
+            "metric_mode": "summary_best"
+          },
+          "dml": {
+            "display_name": "ResNet-34-CIFAR-GELU DML",
+            "run_template": "results/classification_cifar100_cifarstem_followup_v1/cifarstem_dml_v1/classification/cifar100/resnet34_cifar_gelu_dml_kl_seed{seed}",
+            "seeds": [0, 1, 2],
+            "curve_mode": "val_acc_percent",
+            "metric_mode": "summary_best"
+          },
+          "ssml": {
+            "display_name": "ResNet-34-CIFAR-GELU SSML oxtra42",
+            "run_template": "results/classification_cifar100_cifarstem_followup_v1/oxtra42_cifarstem_v1/classification/cifar100/resnet34_cifar_gelu_ssml_kl_seed{seed}",
+            "seeds": [0, 1, 2],
+            "curve_mode": "val_acc_percent",
+            "metric_mode": "summary_best"
+          }
+        }
+      }
+    }
+  }
+}
